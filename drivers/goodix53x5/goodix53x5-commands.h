@@ -42,6 +42,10 @@ void goodix_cmd_reset_sensor (FpiSsm *ssm, FpDevice *dev);
 /* Read 4 bytes of chip ID from register address 0. Expects data. */
 void goodix_cmd_read_chip_id (FpiSsm *ssm, FpDevice *dev);
 
+/* 550c: write a single 16-bit sensor register (ACK only). */
+void goodix_cmd_write_sensor_register (FpiSsm *ssm, FpDevice *dev,
+                                       guint16 address, guint8 v0, guint8 v1);
+
 /* Read the OTP calibration block. Expects data. */
 void goodix_cmd_read_otp (FpiSsm *ssm, FpDevice *dev);
 

@@ -122,6 +122,21 @@ goodix_cmd_reset_sensor (FpiSsm *ssm, FpDevice *dev)
 }
 
 void
+goodix_cmd_write_sensor_register (FpiSsm *ssm, FpDevice *dev,
+                                  guint16 address, guint8 v0, guint8 v1)
+{
+  /* write_sensor_register (single): category=0x8, command=0, payload =
+   * 0x00 | addr(LE16) | value(2). Reply is ACK only. */
+  guint8 payload[5] = {
+    0x00,
+    address & 0xFF, (address >> 8) & 0xFF,
+    v0, v1,
+  };
+
+  goodix_run_cmd (ssm, dev, 0x8, 0x0, payload, 5, FALSE);
+}
+
+void
 goodix_cmd_read_chip_id (FpiSsm *ssm, FpDevice *dev)
 {
   /* read_data(addr=0, size=4): category=0x8, command=0x1 */

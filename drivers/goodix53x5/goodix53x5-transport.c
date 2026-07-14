@@ -151,6 +151,56 @@ goodix_send_tls_pack (FpiSsm       *ssm,
   goodix_submit_padded (ssm, dev, pack, pack_len);
 }
 
+/*
+ * 550c: the last received pack is a 0xB2 TLS-data pack carrying an encrypted
+ * image record. Decrypt it to the raw image plaintext (image[0:14256] + a
+ * 4-byte trailer). Returns newly-allocated plaintext (free with g_free) or
+ * NULL with @error set.
+ */
+guint8 *
+goodix_550c_decrypt_image (FpDevice *dev,
+                           gsize    *out_len,
+                           GError  **error)
+{
+  FpiDeviceGoodix53x5 *self = FPI_DEVICE_GOODIX53X5 (dev);
+  guint8 flag;
+  const guint8 *rec;
+  gsize rec_len;
+  guint8 *plain = NULL;
+
+  if (!goodix_proto_rx_pack (&self->rx, &flag, &rec, &rec_len) ||
+      flag != GOODIX_PACK_FLAG_TLS_DATA)
+    {
+      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                           "Expected a TLS-data (0xB2) image pack");
+      return NULL;
+    }
+
+  /* The pack payload carries a Goodix sub-header before the TLS record; skip
+   * to the first record (17 03 03 ...), as the Python reference does. */
+  {
+    gsize off = 0;
+
+    while (off + 3 <= rec_len &&
+           !(rec[off] == 0x17 && rec[off + 1] == 0x03 && rec[off + 2] == 0x03))
+      off++;
+
+    if (off + 3 > rec_len)
+      {
+        g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                             "No TLS record found in image pack");
+        return NULL;
+      }
+    rec += off;
+    rec_len -= off;
+  }
+
+  if (!goodix_tls_decrypt (self->tls, rec, rec_len, &plain, out_len, error))
+    return NULL;
+
+  return plain;
+}
+
 /**
  * Send a complete protocol message, splitting into USB chunks.
  * Advances the SSM on completion.

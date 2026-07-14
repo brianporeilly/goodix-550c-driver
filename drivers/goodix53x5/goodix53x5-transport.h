@@ -53,6 +53,11 @@ void goodix_send_tls_pack (FpiSsm       *ssm,
                            const guint8 *raw,
                            gsize         raw_len);
 
+/* 550c: decrypt the last-received 0xB2 image pack to raw image plaintext. */
+guint8 *goodix_550c_decrypt_image (FpDevice *dev,
+                                   gsize    *out_len,
+                                   GError  **error);
+
 /**
  * Launch a command sub-SSM that sends a command and receives + validates the
  * ACK. If @expect_data is TRUE, the command also receives the data response,

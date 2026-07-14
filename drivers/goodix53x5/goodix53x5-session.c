@@ -24,6 +24,7 @@
 #include "goodix53x5-transport.h"
 #include "goodix53x5-commands.h"
 #include "goodix53x5-calibration.h"
+#include "goodix53x5-image.h"
 #include "goodix53x5-session.h"
 
 #include <string.h>
@@ -51,6 +52,12 @@ typedef enum {
   GOODIX_OPEN_TLS_RECV_DONE,
   GOODIX_OPEN_TLS_ESTABLISHED,
   GOODIX_OPEN_TLS_FINISH,
+  /* 550c: capture an unsaturated dac_l no-finger reference frame (for FPN
+   * subtraction) at open — also the first end-to-end image/decrypt test. */
+  GOODIX_OPEN_550C_REF_REG_ON,
+  GOODIX_OPEN_550C_REF_IMAGE,
+  GOODIX_OPEN_550C_REF_DECODE,
+  GOODIX_OPEN_550C_REF_FINISH,
   /* --- 53x5 GTLS path --- */
   GOODIX_OPEN_READ_PSK_HASH,
   GOODIX_OPEN_WRITE_PSK,
@@ -334,6 +341,66 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
       fpi_ssm_jump_to_state (ssm, GOODIX_OPEN_UPLOAD_CONFIG);
       break;
 
+    case GOODIX_OPEN_550C_REF_REG_ON:
+      /* Enable image readout: write_sensor_register(0x022c, 0x0a03). */
+      goodix_cmd_write_sensor_register (ssm, dev, 0x022c, 0x0a, 0x03);
+      break;
+
+    case GOODIX_OPEN_550C_REF_IMAGE:
+      /* TX-on, no-finger, dac_l (unsaturated) reference: request "01 06 b4 00".
+       * Reply is a 0xB2 pack (encrypted TLS record). */
+      goodix_cmd_request_image (ssm, dev, TRUE, TRUE, FALSE, self->calib.dac_l);
+      break;
+
+    case GOODIX_OPEN_550C_REF_DECODE:
+      {
+        g_autoptr(GError) error = NULL;
+        g_autofree guint8 *plain = NULL;
+        g_autofree guint16 *img12 = NULL;
+        gsize plain_len = 0;
+
+        plain = goodix_550c_decrypt_image (dev, &plain_len, &error);
+        if (plain == NULL)
+          {
+            fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
+            return;
+          }
+
+        img12 = goodix_device_decode_image (plain, plain_len);
+        if (img12 == NULL)
+          {
+            fpi_ssm_mark_failed (ssm,
+                                 fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                           "550c reference decode failed"));
+            return;
+          }
+
+        /* Diagnostics: a valid frame reads ~2300 mean, not garbage. */
+        {
+          guint32 sum = 0, mn = 0xFFFF, mx = 0;
+          for (int i = 0; i < GOODIX_SENSOR_PIXELS; i++)
+            {
+              guint16 v = img12[i];
+              sum += v;
+              if (v < mn) mn = v;
+              if (v > mx) mx = v;
+            }
+          fp_info ("550c reference frame: plaintext=%zu B, mean=%u min=%u max=%u",
+                   plain_len, sum / GOODIX_SENSOR_PIXELS, mn, mx);
+        }
+
+        g_clear_pointer (&self->reference_image, g_free);
+        self->reference_image = g_steal_pointer (&img12);
+
+        /* Disable image readout again: write_sensor_register(0x022c, 0x0a02). */
+        goodix_cmd_write_sensor_register (ssm, dev, 0x022c, 0x0a, 0x02);
+      }
+      break;
+
+    case GOODIX_OPEN_550C_REF_FINISH:
+      fpi_ssm_jump_to_state (ssm, GOODIX_OPEN_SLEEP);
+      break;
+
     case GOODIX_OPEN_READ_PSK_HASH:
       /* read_psk_hash via production_read(0xB003) */
       goodix_cmd_production_read (ssm, dev, 0xB003);
@@ -576,12 +643,12 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
             return;
           }
 
-        /* 550c: the 53x5 open-time manual-FDT baseline dance is not part of the
-         * proven 550c init flow; skip straight to sleep. FDT arming happens in
-         * the scan path. (Handshake + config upload is what this validates.) */
+        /* 550c: skip the 53x5 manual-FDT baseline dance; instead capture the
+         * no-finger dac_l reference frame (also the first image/decrypt test),
+         * then sleep. FDT arming happens in the scan path. */
         if (self->variant == GOODIX_VARIANT_TLS_PSK)
           {
-            fpi_ssm_jump_to_state (ssm, GOODIX_OPEN_SLEEP);
+            fpi_ssm_jump_to_state (ssm, GOODIX_OPEN_550C_REF_REG_ON);
             return;
           }
 
