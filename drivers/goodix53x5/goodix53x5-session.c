@@ -52,12 +52,6 @@ typedef enum {
   GOODIX_OPEN_TLS_RECV_DONE,
   GOODIX_OPEN_TLS_ESTABLISHED,
   GOODIX_OPEN_TLS_FINISH,
-  /* 550c: capture an unsaturated dac_l no-finger reference frame (for FPN
-   * subtraction) at open — also the first end-to-end image/decrypt test. */
-  GOODIX_OPEN_550C_REF_REG_ON,
-  GOODIX_OPEN_550C_REF_IMAGE,
-  GOODIX_OPEN_550C_REF_DECODE,
-  GOODIX_OPEN_550C_REF_FINISH,
   /* --- 53x5 GTLS path --- */
   GOODIX_OPEN_READ_PSK_HASH,
   GOODIX_OPEN_WRITE_PSK,
@@ -81,33 +75,66 @@ typedef enum {
 static const guint8 goodix_psk[GOODIX_PSK_LEN] = { 0 };
 
 /*
- * 550c per-machine PSK (GOODIX_VARIANT_TLS_PSK). Unlike the 53x5 all-zero PSK,
- * the 550c ships a factory-provisioned PSK stored DPAPI-wrapped in the sensor;
- * this value was recovered from this laptop's Windows install. It is
- * machine-specific — other 550c units need their own recovered PSK here.
+ * The 550c PSK is provisioned per-unit (DPAPI-wrapped in the sensor) and cannot
+ * be derived, so it is NOT hard-coded. The user supplies their recovered PSK
+ * via the GOODIX550C_PSK environment variable (64 hex chars) or the file
+ * /etc/goodix550c.psk. See the driver README for how to recover it.
  */
-static const guint8 goodix_550c_psk[GOODIX_PSK_LEN] = {
-  0xc1, 0xff, 0x7d, 0xf3, 0x3f, 0xea, 0xd7, 0x11,
-  0xff, 0x58, 0x77, 0x17, 0x73, 0x1d, 0xea, 0x5b,
-  0xbd, 0x1e, 0xbf, 0xd5, 0x59, 0x2a, 0x37, 0x43,
-  0xce, 0xd9, 0x85, 0x1a, 0xad, 0x48, 0x20, 0xb3,
-};
+#define GOODIX_550C_PSK_FILE "/etc/goodix550c.psk"
 
-/*
- * 550c FDT bases (24 B each) captured from the Windows driver. The 53x5
- * generates these dynamically from open-time manual FDT; the 550c uses these
- * fixed values (op codes 0x0C down / 0x0E up are added by the FDT commands).
- */
-static const guint8 goodix_550c_fdt_base_down[GOODIX_FDT_BASE_LEN] = {
-  0x9d, 0x9d, 0xa9, 0xa9, 0xa4, 0xa4, 0x9b, 0x9b,
-  0x9e, 0x9e, 0xa9, 0xa9, 0xa6, 0xa6, 0x9c, 0x9c,
-  0x96, 0x96, 0xa4, 0xa4, 0x9f, 0x9f, 0x95, 0x95,
-};
-static const guint8 goodix_550c_fdt_base_up[GOODIX_FDT_BASE_LEN] = {
-  0x88, 0x88, 0x8e, 0x8e, 0x8a, 0x8a, 0x80, 0x80,
-  0x87, 0x87, 0x8e, 0x8e, 0x8e, 0x8e, 0x83, 0x83,
-  0x7f, 0x7f, 0x90, 0x90, 0x88, 0x88, 0x7c, 0x7c,
-};
+static gboolean
+goodix_550c_load_psk (guint8   out[GOODIX_PSK_LEN],
+                      GError **error)
+{
+  g_autofree gchar *hex = NULL;
+  const gchar *env = g_getenv ("GOODIX550C_PSK");
+
+  if (env != NULL && *env != '\0')
+    {
+      hex = g_strdup (env);
+    }
+  else
+    {
+      g_autofree gchar *contents = NULL;
+
+      if (!g_file_get_contents (GOODIX_550C_PSK_FILE, &contents, NULL, NULL))
+        {
+          g_set_error_literal (error, FP_DEVICE_ERROR,
+                               FP_DEVICE_ERROR_NOT_SUPPORTED,
+                               "No 550c PSK configured: set GOODIX550C_PSK or "
+                               "create " GOODIX_550C_PSK_FILE " (64 hex chars). "
+                               "See the driver README to recover your PSK.");
+          return FALSE;
+        }
+      hex = g_steal_pointer (&contents);
+    }
+
+  g_strstrip (hex);
+  if (strlen (hex) != GOODIX_PSK_LEN * 2)
+    {
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
+                   "550c PSK must be %d hex chars, got %zu",
+                   GOODIX_PSK_LEN * 2, strlen (hex));
+      return FALSE;
+    }
+
+  for (int i = 0; i < GOODIX_PSK_LEN; i++)
+    {
+      gint hi = g_ascii_xdigit_value (hex[i * 2]);
+      gint lo = g_ascii_xdigit_value (hex[i * 2 + 1]);
+
+      if (hi < 0 || lo < 0)
+        {
+          g_set_error_literal (error, FP_DEVICE_ERROR,
+                               FP_DEVICE_ERROR_NOT_SUPPORTED,
+                               "550c PSK contains non-hex characters");
+          return FALSE;
+        }
+      out[i] = (guint8) ((hi << 4) | lo);
+    }
+
+  return TRUE;
+}
 
 /* PSK white box for writing all-zero PSK */
 static const guint8 goodix_psk_white_box[GOODIX_PSK_WHITE_BOX_LEN] = {
@@ -269,8 +296,17 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
 
     case GOODIX_OPEN_TLS_INIT:
       {
+        guint8 psk[GOODIX_PSK_LEN];
+        g_autoptr(GError) psk_error = NULL;
+
+        if (!goodix_550c_load_psk (psk, &psk_error))
+          {
+            fpi_ssm_mark_failed (ssm, g_steal_pointer (&psk_error));
+            return;
+          }
+
         g_clear_pointer (&self->tls, goodix_tls_free);
-        self->tls = goodix_tls_new (goodix_550c_psk, GOODIX_PSK_LEN);
+        self->tls = goodix_tls_new (psk, GOODIX_PSK_LEN);
         if (self->tls == NULL)
           {
             fpi_ssm_mark_failed (ssm,
@@ -355,73 +391,6 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
 
     case GOODIX_OPEN_TLS_FINISH:
       fpi_ssm_jump_to_state (ssm, GOODIX_OPEN_UPLOAD_CONFIG);
-      break;
-
-    case GOODIX_OPEN_550C_REF_REG_ON:
-      /* Enable image readout: write_sensor_register(0x022c, 0x0a03). */
-      goodix_cmd_write_sensor_register (ssm, dev, 0x022c, 0x0a, 0x03);
-      break;
-
-    case GOODIX_OPEN_550C_REF_IMAGE:
-      /* TX-on, no-finger, dac_l (unsaturated) reference: request "01 06 b4 00".
-       * Reply is a 0xB2 pack (encrypted TLS record). */
-      goodix_cmd_request_image (ssm, dev, TRUE, TRUE, FALSE, self->calib.dac_l);
-      break;
-
-    case GOODIX_OPEN_550C_REF_DECODE:
-      {
-        g_autoptr(GError) error = NULL;
-        g_autofree guint8 *plain = NULL;
-        g_autofree guint16 *img12 = NULL;
-        gsize plain_len = 0;
-
-        plain = goodix_550c_decrypt_image (dev, &plain_len, &error);
-        if (plain == NULL)
-          {
-            fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
-            return;
-          }
-
-        img12 = goodix_device_decode_image (plain, plain_len);
-        if (img12 == NULL)
-          {
-            fpi_ssm_mark_failed (ssm,
-                                 fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
-                                                           "550c reference decode failed"));
-            return;
-          }
-
-        /* Diagnostics: a valid frame reads ~2300 mean, not garbage. */
-        {
-          guint32 sum = 0, mn = 0xFFFF, mx = 0;
-          for (int i = 0; i < GOODIX_SENSOR_PIXELS; i++)
-            {
-              guint16 v = img12[i];
-              sum += v;
-              if (v < mn) mn = v;
-              if (v > mx) mx = v;
-            }
-          fp_info ("550c reference frame: plaintext=%zu B, mean=%u min=%u max=%u",
-                   plain_len, sum / GOODIX_SENSOR_PIXELS, mn, mx);
-        }
-
-        g_clear_pointer (&self->reference_image, g_free);
-        self->reference_image = g_steal_pointer (&img12);
-
-        /* Install the fixed 550c FDT bases for the scan-path finger detection. */
-        memcpy (self->calib.fdt_base_down, goodix_550c_fdt_base_down,
-                GOODIX_FDT_BASE_LEN);
-        memcpy (self->calib.fdt_base_up, goodix_550c_fdt_base_up,
-                GOODIX_FDT_BASE_LEN);
-        memset (self->calib.fdt_base_manual, 0, GOODIX_FDT_BASE_LEN);
-
-        /* Disable image readout again: write_sensor_register(0x022c, 0x0a02). */
-        goodix_cmd_write_sensor_register (ssm, dev, 0x022c, 0x0a, 0x02);
-      }
-      break;
-
-    case GOODIX_OPEN_550C_REF_FINISH:
-      fpi_ssm_jump_to_state (ssm, GOODIX_OPEN_SLEEP);
       break;
 
     case GOODIX_OPEN_READ_PSK_HASH:
@@ -666,16 +635,9 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
             return;
           }
 
-        /* 550c: skip the 53x5 manual-FDT baseline dance; instead capture the
-         * no-finger dac_l reference frame (also the first image/decrypt test),
-         * then sleep. FDT arming happens in the scan path. */
-        if (self->variant == GOODIX_VARIANT_TLS_PSK)
-          {
-            fpi_ssm_jump_to_state (ssm, GOODIX_OPEN_550C_REF_REG_ON);
-            return;
-          }
-
-        /* FDT manual operation with TX enabled */
+        /* FDT manual operation with TX enabled. Both variants derive the FDT
+         * baseline from live no-finger readings here (the 550c no longer uses
+         * fixed Windows-captured bases). */
         goodix_cmd_fdt_manual (ssm, dev, TRUE, self->calib.fdt_base_manual);
       }
       break;
