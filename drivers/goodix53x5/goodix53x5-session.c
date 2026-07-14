@@ -93,6 +93,22 @@ static const guint8 goodix_550c_psk[GOODIX_PSK_LEN] = {
   0xce, 0xd9, 0x85, 0x1a, 0xad, 0x48, 0x20, 0xb3,
 };
 
+/*
+ * 550c FDT bases (24 B each) captured from the Windows driver. The 53x5
+ * generates these dynamically from open-time manual FDT; the 550c uses these
+ * fixed values (op codes 0x0C down / 0x0E up are added by the FDT commands).
+ */
+static const guint8 goodix_550c_fdt_base_down[GOODIX_FDT_BASE_LEN] = {
+  0x9d, 0x9d, 0xa9, 0xa9, 0xa4, 0xa4, 0x9b, 0x9b,
+  0x9e, 0x9e, 0xa9, 0xa9, 0xa6, 0xa6, 0x9c, 0x9c,
+  0x96, 0x96, 0xa4, 0xa4, 0x9f, 0x9f, 0x95, 0x95,
+};
+static const guint8 goodix_550c_fdt_base_up[GOODIX_FDT_BASE_LEN] = {
+  0x88, 0x88, 0x8e, 0x8e, 0x8a, 0x8a, 0x80, 0x80,
+  0x87, 0x87, 0x8e, 0x8e, 0x8e, 0x8e, 0x83, 0x83,
+  0x7f, 0x7f, 0x90, 0x90, 0x88, 0x88, 0x7c, 0x7c,
+};
+
 /* PSK white box for writing all-zero PSK */
 static const guint8 goodix_psk_white_box[GOODIX_PSK_WHITE_BOX_LEN] = {
   0xec, 0x35, 0xae, 0x3a, 0xbb, 0x45, 0xed, 0x3f,
@@ -391,6 +407,13 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
 
         g_clear_pointer (&self->reference_image, g_free);
         self->reference_image = g_steal_pointer (&img12);
+
+        /* Install the fixed 550c FDT bases for the scan-path finger detection. */
+        memcpy (self->calib.fdt_base_down, goodix_550c_fdt_base_down,
+                GOODIX_FDT_BASE_LEN);
+        memcpy (self->calib.fdt_base_up, goodix_550c_fdt_base_up,
+                GOODIX_FDT_BASE_LEN);
+        memset (self->calib.fdt_base_manual, 0, GOODIX_FDT_BASE_LEN);
 
         /* Disable image readout again: write_sensor_register(0x022c, 0x0a02). */
         goodix_cmd_write_sensor_register (ssm, dev, 0x022c, 0x0a, 0x02);

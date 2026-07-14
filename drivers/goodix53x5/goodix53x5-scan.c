@@ -41,21 +41,28 @@ typedef enum {
   GOODIX_FINGER_WAIT_NUM_STATES,
 } GoodixFingerWaitState;
 
-/* Capture SSM */
+/* Capture SSM. The 550c wraps image readout in write_sensor_register(0x022c)
+ * enable/disable and decrypts a 0xB2 TLS-data pack; the 53x5 does neither.
+ * REG_ON/REG_OFF_DONE are 550c-only (the 53x5 jumps past them). */
 typedef enum {
-  GOODIX_CAPTURE_GET_IMAGE = 0,
+  GOODIX_CAPTURE_REG_ON = 0,
+  GOODIX_CAPTURE_GET_IMAGE,
   GOODIX_CAPTURE_DECRYPT,
-  GOODIX_CAPTURE_DECODE,
+  GOODIX_CAPTURE_REG_OFF_DONE,
   GOODIX_CAPTURE_STORE,
   GOODIX_CAPTURE_NUM_STATES,
 } GoodixCaptureState;
 
-/* TX-off no-finger reference capture SSM */
+/* No-finger reference capture SSM. 53x5: EC power + TX-off dac_l + GTLS decrypt.
+ * 550c: no EC, write_sensor_register wrapper, TX-on dac_l, 0xB2/TLS decrypt.
+ * REG_ON/REG_OFF_DONE are 550c-only. */
 typedef enum {
   GOODIX_REF_CAPTURE_EC_POWER_ON = 0,
   GOODIX_REF_CAPTURE_EC_POWER_ON_DONE,
+  GOODIX_REF_CAPTURE_REG_ON,
   GOODIX_REF_CAPTURE_GET_IMAGE,
   GOODIX_REF_CAPTURE_DECODE,
+  GOODIX_REF_CAPTURE_REG_OFF_DONE,
   GOODIX_REF_CAPTURE_NUM_STATES,
 } GoodixRefCaptureState;
 
@@ -99,6 +106,13 @@ goodix_ref_capture_ssm_handler (FpiSsm   *ssm,
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case GOODIX_REF_CAPTURE_EC_POWER_ON:
+      /* 550c does not use EC power control; it wraps readout in register
+       * writes instead. */
+      if (self->variant == GOODIX_VARIANT_TLS_PSK)
+        {
+          fpi_ssm_jump_to_state (ssm, GOODIX_REF_CAPTURE_REG_ON);
+          return;
+        }
       goodix_cmd_ec_control (ssm, dev, TRUE);
       break;
 
@@ -114,10 +128,19 @@ goodix_ref_capture_ssm_handler (FpiSsm   *ssm,
       fpi_ssm_next_state (ssm);
       break;
 
+    case GOODIX_REF_CAPTURE_REG_ON:
+      if (self->variant == GOODIX_VARIANT_TLS_PSK)
+        goodix_cmd_write_sensor_register (ssm, dev, 0x022c, 0x0a, 0x03);
+      else
+        fpi_ssm_jump_to_state (ssm, GOODIX_REF_CAPTURE_GET_IMAGE);
+      break;
+
     case GOODIX_REF_CAPTURE_GET_IMAGE:
-      /* TX-off no-finger reference frame */
-      goodix_cmd_request_image (ssm, dev, FALSE, TRUE, FALSE,
-                                self->calib.dac_l);
+      /* No-finger dac_l reference frame. 550c uses TX-on (op 0x01, matches the
+       * validated pipeline); 53x5 uses TX-off (op 0x81). */
+      goodix_cmd_request_image (ssm, dev,
+                                self->variant == GOODIX_VARIANT_TLS_PSK,
+                                TRUE, FALSE, self->calib.dac_l);
       break;
 
     case GOODIX_REF_CAPTURE_DECODE:
@@ -128,23 +151,37 @@ goodix_ref_capture_ssm_handler (FpiSsm   *ssm,
         g_autofree guint8 *decrypted = NULL;
         g_autofree guint16 *img12 = NULL;
 
-        if (!goodix_parse_reply (dev, &cat, &cmd, &pl, &pl_len, NULL))
+        if (self->variant == GOODIX_VARIANT_TLS_PSK)
           {
-            fpi_ssm_mark_failed (ssm,
-                                 fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
-                                                           "Failed to parse reference response"));
-            return;
-          }
+            g_autoptr(GError) error = NULL;
 
-        decrypted = goodix_crypto_gtls_decrypt_sensor_data (&self->gtls,
-                                                            pl, pl_len,
-                                                            &dec_len);
-        if (decrypted == NULL)
+            decrypted = goodix_550c_decrypt_image (dev, &dec_len, &error);
+            if (decrypted == NULL)
+              {
+                fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
+                return;
+              }
+          }
+        else
           {
-            fpi_ssm_mark_failed (ssm,
-                                 fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
-                                                           "Reference image decryption failed"));
-            return;
+            if (!goodix_parse_reply (dev, &cat, &cmd, &pl, &pl_len, NULL))
+              {
+                fpi_ssm_mark_failed (ssm,
+                                     fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                               "Failed to parse reference response"));
+                return;
+              }
+
+            decrypted = goodix_crypto_gtls_decrypt_sensor_data (&self->gtls,
+                                                                pl, pl_len,
+                                                                &dec_len);
+            if (decrypted == NULL)
+              {
+                fpi_ssm_mark_failed (ssm,
+                                     fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                               "Reference image decryption failed"));
+                return;
+              }
           }
 
         img12 = goodix_device_decode_image (decrypted, dec_len);
@@ -158,8 +195,18 @@ goodix_ref_capture_ssm_handler (FpiSsm   *ssm,
 
         g_clear_pointer (&self->reference_image, g_free);
         self->reference_image = g_steal_pointer (&img12);
-        fpi_ssm_mark_completed (ssm);
+
+        /* 550c: disable image readout again, then complete. */
+        if (self->variant == GOODIX_VARIANT_TLS_PSK)
+          goodix_cmd_write_sensor_register (ssm, dev, 0x022c, 0x0a, 0x02);
+        else
+          fpi_ssm_mark_completed (ssm);
       }
+      break;
+
+    case GOODIX_REF_CAPTURE_REG_OFF_DONE:
+      /* 550c: reg-off ACK consumed by the command sub-SSM. */
+      fpi_ssm_mark_completed (ssm);
       break;
     }
 }
@@ -181,6 +228,12 @@ goodix_finger_wait_ssm_handler (FpiSsm   *ssm,
       fpi_device_report_finger_status_changes (dev,
                                                FP_FINGER_STATUS_NEEDED,
                                                FP_FINGER_STATUS_PRESENT);
+      /* 550c does not use EC power control. */
+      if (self->variant == GOODIX_VARIANT_TLS_PSK)
+        {
+          fpi_ssm_jump_to_state (ssm, GOODIX_FINGER_WAIT_FDT_DOWN_SETUP);
+          return;
+        }
       goodix_cmd_ec_control (ssm, dev, TRUE);
       break;
 
@@ -294,8 +347,15 @@ goodix_capture_ssm_handler (FpiSsm   *ssm,
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
+    case GOODIX_CAPTURE_REG_ON:
+      if (self->variant == GOODIX_VARIANT_TLS_PSK)
+        goodix_cmd_write_sensor_register (ssm, dev, 0x022c, 0x0a, 0x03);
+      else
+        fpi_ssm_jump_to_state (ssm, GOODIX_CAPTURE_GET_IMAGE);
+      break;
+
     case GOODIX_CAPTURE_GET_IMAGE:
-      /* Live TX-on finger frame */
+      /* Live TX-on finger frame (op 0x41, dac_h) */
       goodix_cmd_request_image (ssm, dev, TRUE, TRUE, TRUE,
                                 self->calib.dac_h);
       break;
@@ -307,23 +367,37 @@ goodix_capture_ssm_handler (FpiSsm   *ssm,
         gsize pl_len, dec_len;
         guint8 *decrypted;
 
-        if (!goodix_parse_reply (dev, &cat, &cmd, &pl, &pl_len, NULL))
+        if (self->variant == GOODIX_VARIANT_TLS_PSK)
           {
-            fpi_ssm_mark_failed (ssm,
-                                 fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
-                                                           "Failed to parse capture response"));
-            return;
-          }
+            g_autoptr(GError) error = NULL;
 
-        decrypted = goodix_crypto_gtls_decrypt_sensor_data (&self->gtls,
-                                                             pl, pl_len,
-                                                             &dec_len);
-        if (decrypted == NULL)
+            decrypted = goodix_550c_decrypt_image (dev, &dec_len, &error);
+            if (decrypted == NULL)
+              {
+                fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
+                return;
+              }
+          }
+        else
           {
-            fpi_ssm_mark_failed (ssm,
-                                 fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
-                                                           "Capture image decryption failed"));
-            return;
+            if (!goodix_parse_reply (dev, &cat, &cmd, &pl, &pl_len, NULL))
+              {
+                fpi_ssm_mark_failed (ssm,
+                                     fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                               "Failed to parse capture response"));
+                return;
+              }
+
+            decrypted = goodix_crypto_gtls_decrypt_sensor_data (&self->gtls,
+                                                                 pl, pl_len,
+                                                                 &dec_len);
+            if (decrypted == NULL)
+              {
+                fpi_ssm_mark_failed (ssm,
+                                     fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                               "Capture image decryption failed"));
+                return;
+              }
           }
 
         /* Decode 12-bit and convert to 8-bit */
@@ -363,12 +437,16 @@ goodix_capture_ssm_handler (FpiSsm   *ssm,
           self->captured_image = img8;
         }
 
-        fpi_ssm_next_state (ssm);
+        /* 550c: disable image readout again, then store; 53x5: store. */
+        if (self->variant == GOODIX_VARIANT_TLS_PSK)
+          goodix_cmd_write_sensor_register (ssm, dev, 0x022c, 0x0a, 0x02);
+        else
+          fpi_ssm_jump_to_state (ssm, GOODIX_CAPTURE_STORE);
       }
       break;
 
-    case GOODIX_CAPTURE_DECODE:
-      /* Already decoded in previous state, just advance */
+    case GOODIX_CAPTURE_REG_OFF_DONE:
+      /* 550c: the reg-off ACK was consumed by the command sub-SSM. */
       fpi_ssm_next_state (ssm);
       break;
 
@@ -434,6 +512,11 @@ goodix_finger_up_ssm_handler (FpiSsm   *ssm,
       break;
 
     case GOODIX_FINGER_UP_EC_POWER_OFF:
+      if (self->variant == GOODIX_VARIANT_TLS_PSK)
+        {
+          fpi_ssm_mark_completed (ssm);
+          return;
+        }
       goodix_cmd_ec_control (ssm, dev, FALSE);
       break;
 
@@ -461,6 +544,8 @@ static void
 goodix_deactivate_ssm_handler (FpiSsm   *ssm,
                                FpDevice *dev)
 {
+  FpiDeviceGoodix53x5 *self = FPI_DEVICE_GOODIX53X5 (dev);
+
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case GOODIX_DEACTIVATE_SLEEP:
@@ -468,6 +553,11 @@ goodix_deactivate_ssm_handler (FpiSsm   *ssm,
       break;
 
     case GOODIX_DEACTIVATE_EC_POWER_OFF:
+      if (self->variant == GOODIX_VARIANT_TLS_PSK)
+        {
+          fpi_ssm_mark_completed (ssm);
+          return;
+        }
       goodix_cmd_ec_control (ssm, dev, FALSE);
       break;
 
