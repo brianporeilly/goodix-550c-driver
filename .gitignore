@@ -3,3 +3,7 @@ libfprint/
 *.o
 *.orig
 open_test
+sysext/goodix550c-fp/
+sysext/.stage/
+sysext-stage/
+opencv-bundle/
