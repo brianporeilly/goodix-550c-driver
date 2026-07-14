@@ -1,0 +1,5 @@
+builddir/
+libfprint/
+*.o
+*.orig
+open_test
