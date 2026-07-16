@@ -26,6 +26,7 @@
 #include "goodix53x5-calibration.h"
 #include "goodix53x5-image.h"
 #include "goodix53x5-session.h"
+#include "goodix53x5-firmware550c.h"
 
 #include <string.h>
 #include <openssl/rand.h>
@@ -131,6 +132,24 @@ goodix_550c_load_psk (guint8   out[GOODIX_PSK_LEN],
     }
 
   return TRUE;
+}
+
+/*
+ * TRUE if the operator has explicitly pinned this unit to a specific PSK
+ * (env var or config file). Such a unit is deliberately on a per-machine PSK,
+ * so self-heal must NOT reprovision it to all-zero — it would destroy the very
+ * PSK the operator recovered. Only units left on the default (all-zero) path
+ * are eligible for self-heal.
+ */
+static gboolean
+goodix_550c_has_psk_override (void)
+{
+  const gchar *env = g_getenv ("GOODIX550C_PSK");
+
+  if (env != NULL && *env != '\0')
+    return TRUE;
+
+  return g_file_test (GOODIX_550C_PSK_FILE, G_FILE_TEST_EXISTS);
 }
 
 /* PSK white box for writing all-zero PSK */
@@ -295,6 +314,10 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
       {
         guint8 psk[GOODIX_PSK_LEN];
         g_autoptr(GError) psk_error = NULL;
+
+        /* Mark that the open reached the handshake: a failure from here (with
+         * no PSK override) is what arms self-heal reprovisioning. */
+        self->open_reached_tls = TRUE;
 
         if (!goodix_550c_load_psk (psk, &psk_error))
           {
@@ -734,6 +757,478 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
     }
 }
 
+/* ========================================================================
+ * Self-heal PSK provisioning (550c only)
+ *
+ * When the all-zero TLS-PSK handshake fails on a 550c that has no explicit PSK
+ * override, the unit is almost certainly still on a Windows-provisioned
+ * per-machine PSK. Rather than fail the open, we replay the reverse-engineered
+ * provisioning sequence to move it to the family-standard all-zero PSK, then
+ * retry the open from scratch. This mirrors what Windows does (check, then
+ * provision) and matches captures/provision_container_allzero.py.
+ *
+ * Sequence, in IAP mode (entered via mcu_erase_app):
+ *   erase_app -> IAP
+ *   preset_psk_write(container)   full Windows-style container: 56a5bb95 prefix
+ *                                 + slot 0xbb010002 (device-ignored filler)
+ *                                 + slot 0xbb010003 (all-zero family white-box)
+ *   write_firmware(app, number=2) 256-byte chunks
+ *   check_firmware(all-zero HMAC) commits + validates the reflash
+ *   reset -> app; re-run open (handshake now succeeds on all-zero)
+ *
+ * A bare single-slot white-box write is accepted but does NOT commit the PSK on
+ * the 550c — only the two-slot container write does. See the RE notes.
+ *
+ * HARDWARE-RISK: this writes firmware over USB. A mis-framed write can wedge the
+ * USB stack until a cold boot (the device returns in IAP, so a re-run is
+ * idempotent). The framing here is a faithful port of the proven Python; the
+ * USB re-enumeration handling (erase/reset -> reclaim) is the part that still
+ * needs on-hardware validation.
+ * ======================================================================== */
+
+static void goodix_cleanup_failed_open (FpDevice *dev);
+
+/* Container geometry (bytes). */
+#define GOODIX_550C_CONTAINER_PREFIX_LEN 10
+#define GOODIX_550C_PSK_FILLER_LEN       324   /* slot 0xbb010002 payload */
+#define GOODIX_550C_CONTAINER_LEN        446   /* prefix + both TLV slots */
+#define GOODIX_550C_FW_CHUNK             256
+#define GOODIX_550C_FW_NUMBER            2
+#define GOODIX_550C_REENUM_SETTLE_MS     1500  /* wait for USB re-enumeration */
+
+/*
+ * Slot 0xbb010002 filler. The firmware ignores this slot (it cannot unseal
+ * Windows' DPAPI blob) and does NOT cross-check it against slot 0xbb010003, so
+ * the driver ships neutral, non-secret padding here rather than any captured
+ * per-machine blob.
+ *
+ * NOTE (pending on-hardware confirmation): all-zero filler is the hypothesis to
+ * validate first — a live container write on an already-all-zero unit whose
+ * check_firmware passes proves it. If the firmware turns out to require a
+ * well-formed blob, replace this with a captured generic blob (documented as
+ * non-secret padding). Nothing else in this file changes.
+ */
+static const guint8 goodix_550c_psk_filler[GOODIX_550C_PSK_FILLER_LEN] = { 0 };
+
+/* The all-zero-PSK check_firmware HMAC over goodix_550c_app_firmware. Derived
+ * at runtime from the target PSK (goodix_550c_fw_hmac); this constant is only a
+ * self-check that the derivation and the embedded firmware are intact before we
+ * touch the device. Verified against the genesis captures. */
+static const guint8 goodix_550c_allzero_fw_hmac[32] = {
+  0x02, 0x5b, 0x4d, 0x2d, 0x83, 0xa8, 0x98, 0xab,
+  0x3f, 0x9d, 0xa1, 0xa0, 0xff, 0x0b, 0x2d, 0x72,
+  0xc3, 0x1d, 0x38, 0x5c, 0x15, 0x66, 0x58, 0x4d,
+  0x40, 0x3f, 0x23, 0xd2, 0xe2, 0xa6, 0xc2, 0x06,
+};
+
+/*
+ * Derive the 550c check_firmware HMAC for @psk over @fw:
+ *   pmk      = SHA256( len16be(psk) | zeros(len(psk)) | len16be(psk) | psk )
+ *   pmk_hmac = HMAC-SHA256( pmk, bytes 1..64 )
+ *   fw_hmac  = HMAC-SHA256( pmk_hmac, fw )
+ * (This is the 550c formula; it diverges from the sibling family's
+ * pmk=SHA256((len16be|psk)*2), though the two coincide for an all-zero PSK.)
+ */
+static void
+goodix_550c_fw_hmac (const guint8 *psk, gsize psk_len,
+                     const guint8 *fw, gsize fw_len,
+                     guint8 out[32])
+{
+  gsize pre_len = 2 + psk_len + 2 + psk_len;
+  g_autofree guint8 *pre = g_malloc0 (pre_len);
+  guint8 pmk[32];
+  gsize pmk_len = sizeof (pmk);
+  guint8 mod[64];
+  guint8 pmk_hmac[32];
+  gsize hlen;
+  g_autoptr(GChecksum) sha = g_checksum_new (G_CHECKSUM_SHA256);
+  GHmac *h;
+
+  pre[0] = (psk_len >> 8) & 0xff;
+  pre[1] = psk_len & 0xff;
+  /* middle zeros(len) already zeroed by g_malloc0 */
+  pre[2 + psk_len] = (psk_len >> 8) & 0xff;
+  pre[2 + psk_len + 1] = psk_len & 0xff;
+  memcpy (pre + 2 + psk_len + 2, psk, psk_len);
+
+  g_checksum_update (sha, pre, pre_len);
+  g_checksum_get_digest (sha, pmk, &pmk_len);
+
+  for (int i = 0; i < 64; i++)
+    mod[i] = (guint8) (i + 1);
+
+  hlen = sizeof (pmk_hmac);
+  h = g_hmac_new (G_CHECKSUM_SHA256, pmk, sizeof (pmk));
+  g_hmac_update (h, mod, sizeof (mod));
+  g_hmac_get_digest (h, pmk_hmac, &hlen);
+  g_hmac_unref (h);
+
+  hlen = 32;
+  h = g_hmac_new (G_CHECKSUM_SHA256, pmk_hmac, sizeof (pmk_hmac));
+  g_hmac_update (h, fw, fw_len);
+  g_hmac_get_digest (h, out, &hlen);
+  g_hmac_unref (h);
+}
+
+static void
+goodix_heal_put_u32_le (guint8 *out, guint32 v)
+{
+  out[0] = v & 0xff;
+  out[1] = (v >> 8) & 0xff;
+  out[2] = (v >> 16) & 0xff;
+  out[3] = (v >> 24) & 0xff;
+}
+
+/* Assemble the 446-byte PSK container into a freshly allocated buffer. */
+static guint8 *
+goodix_550c_build_container (void)
+{
+  static const guint8 prefix[GOODIX_550C_CONTAINER_PREFIX_LEN] = {
+    0x56, 0xa5, 0xbb, 0x95, 0x6b, 0x7c, 0x8d, 0x9e, 0x00, 0x00,
+  };
+  guint8 *buf = g_malloc (GOODIX_550C_CONTAINER_LEN);
+  gsize o = 0;
+
+  memcpy (buf + o, prefix, sizeof (prefix));
+  o += sizeof (prefix);
+
+  /* slot 0xbb010002 | len 324 | filler */
+  goodix_heal_put_u32_le (buf + o, 0xbb010002); o += 4;
+  goodix_heal_put_u32_le (buf + o, GOODIX_550C_PSK_FILLER_LEN); o += 4;
+  memcpy (buf + o, goodix_550c_psk_filler, GOODIX_550C_PSK_FILLER_LEN);
+  o += GOODIX_550C_PSK_FILLER_LEN;
+
+  /* slot 0xbb010003 | len 96 | all-zero family white-box */
+  goodix_heal_put_u32_le (buf + o, 0xbb010003); o += 4;
+  goodix_heal_put_u32_le (buf + o, GOODIX_PSK_WHITE_BOX_LEN); o += 4;
+  memcpy (buf + o, goodix_psk_white_box, GOODIX_PSK_WHITE_BOX_LEN);
+  o += GOODIX_PSK_WHITE_BOX_LEN;
+
+  g_assert (o == GOODIX_550C_CONTAINER_LEN);
+  return buf;
+}
+
+/*
+ * Drop a stale interface claim (best effort), reset the port, and re-claim.
+ * Needed after the device re-enumerates on erase_app / reset. Synchronous, like
+ * the open SSM's USB-reset state.
+ */
+static gboolean
+goodix_heal_reset_and_claim (FpDevice *dev, GError **error)
+{
+  FpiDeviceGoodix53x5 *self = FPI_DEVICE_GOODIX53X5 (dev);
+  GUsbDevice *usb = fpi_device_get_usb_device (dev);
+
+  if (self->usb_interface_claimed)
+    {
+      g_autoptr(GError) rel_err = NULL;
+      /* Expected to fail after re-enumeration; recovery proceeds regardless. */
+      if (!g_usb_device_release_interface (usb, self->usb_interface, 0,
+                                           &rel_err))
+        fp_dbg ("Releasing stale interface before heal reset: %s",
+                rel_err->message);
+      self->usb_interface_claimed = FALSE;
+    }
+
+  if (!g_usb_device_reset (usb, error))
+    return FALSE;
+
+  if (!g_usb_device_claim_interface (
+          usb, self->usb_interface,
+          G_USB_DEVICE_CLAIM_INTERFACE_BIND_KERNEL_DRIVER, error))
+    return FALSE;
+
+  self->usb_interface_claimed = TRUE;
+  return TRUE;
+}
+
+typedef enum {
+  GOODIX_HEAL_READ_FW_VERSION = 0,
+  GOODIX_HEAL_DECIDE_MODE,
+  GOODIX_HEAL_ERASE_APP,
+  GOODIX_HEAL_ERASE_SETTLE,
+  GOODIX_HEAL_ERASE_RESET,
+  GOODIX_HEAL_CONTAINER_WRITE1,
+  GOODIX_HEAL_CONTAINER_WRITE2,
+  GOODIX_HEAL_WRITE_FW_BEGIN,
+  GOODIX_HEAL_WRITE_FW_SEND,
+  GOODIX_HEAL_WRITE_FW_NEXT,
+  GOODIX_HEAL_CHECK_FW,
+  GOODIX_HEAL_RESET_MCU,
+  GOODIX_HEAL_RESET_SETTLE,
+  GOODIX_HEAL_NUM_STATES,
+} GoodixHealState;
+
+static void
+goodix_heal_ssm_handler (FpiSsm   *ssm,
+                         FpDevice *dev)
+{
+  FpiDeviceGoodix53x5 *self = FPI_DEVICE_GOODIX53X5 (dev);
+  GoodixHealState state = fpi_ssm_get_cur_state (ssm);
+
+  switch (state)
+    {
+    case GOODIX_HEAL_READ_FW_VERSION:
+      goodix_cmd_read_fw_version (ssm, dev);
+      break;
+
+    case GOODIX_HEAL_DECIDE_MODE:
+      {
+        g_autoptr(GError) error = NULL;
+        const guint8 *pl;
+        gsize pl_len;
+        g_autofree gchar *ver = NULL;
+
+        if (!goodix_cmd_parse_fw_version_reply (dev, &pl, &pl_len, &error))
+          {
+            fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
+            return;
+          }
+
+        ver = g_strndup ((const gchar *) pl,
+                         strnlen ((const gchar *) pl, pl_len));
+        fp_info ("Self-heal: device firmware '%s'", ver);
+
+        if (strstr (ver, "IAP") != NULL)
+          {
+            fpi_ssm_jump_to_state (ssm, GOODIX_HEAL_CONTAINER_WRITE1);
+            return;
+          }
+
+        if (self->heal_erased)
+          {
+            fpi_ssm_mark_failed (ssm,
+                fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                    "Self-heal: device did not enter IAP after erase"));
+            return;
+          }
+
+        fpi_ssm_next_state (ssm);   /* -> ERASE_APP */
+      }
+      break;
+
+    case GOODIX_HEAL_ERASE_APP:
+      fp_info ("Self-heal: erasing app to enter IAP");
+      self->heal_erased = TRUE;
+      goodix_cmd_mcu_erase_app (ssm, dev);
+      break;
+
+    case GOODIX_HEAL_ERASE_SETTLE:
+      /* Let the device drop off the bus and re-enumerate into IAP. */
+      fpi_ssm_next_state_delayed (ssm, GOODIX_550C_REENUM_SETTLE_MS);
+      break;
+
+    case GOODIX_HEAL_ERASE_RESET:
+      {
+        g_autoptr(GError) error = NULL;
+
+        if (!goodix_heal_reset_and_claim (dev, &error))
+          {
+            fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
+            return;
+          }
+        fpi_ssm_jump_to_state (ssm, GOODIX_HEAL_READ_FW_VERSION);
+      }
+      break;
+
+    case GOODIX_HEAL_CONTAINER_WRITE1:
+      fp_info ("Self-heal: writing PSK container (chunk 1/2)");
+      goodix_cmd_preset_psk_write_chunk (ssm, dev, GOODIX_550C_CONTAINER_LEN,
+                                         GOODIX_550C_FW_CHUNK, 0,
+                                         self->heal_container);
+      break;
+
+    case GOODIX_HEAL_CONTAINER_WRITE2:
+      {
+        g_autoptr(GError) error = NULL;
+
+        if (!goodix_cmd_parse_preset_psk_write_reply (dev, &error))
+          {
+            fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
+            return;
+          }
+
+        fp_info ("Self-heal: writing PSK container (chunk 2/2)");
+        goodix_cmd_preset_psk_write_chunk (
+            ssm, dev, GOODIX_550C_CONTAINER_LEN,
+            GOODIX_550C_CONTAINER_LEN - GOODIX_550C_FW_CHUNK,
+            GOODIX_550C_FW_CHUNK,
+            self->heal_container + GOODIX_550C_FW_CHUNK);
+      }
+      break;
+
+    case GOODIX_HEAL_WRITE_FW_BEGIN:
+      {
+        g_autoptr(GError) error = NULL;
+
+        if (!goodix_cmd_parse_preset_psk_write_reply (dev, &error))
+          {
+            fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
+            return;
+          }
+
+        fp_info ("Self-heal: reflashing app firmware (%d bytes)",
+                 GOODIX_550C_APP_FIRMWARE_LEN);
+        self->heal_fw_offset = 0;
+        fpi_ssm_jump_to_state (ssm, GOODIX_HEAL_WRITE_FW_SEND);
+      }
+      break;
+
+    case GOODIX_HEAL_WRITE_FW_SEND:
+      {
+        guint32 off = self->heal_fw_offset;
+        gsize remaining;
+
+        if (off >= GOODIX_550C_APP_FIRMWARE_LEN)
+          {
+            fpi_ssm_jump_to_state (ssm, GOODIX_HEAL_CHECK_FW);
+            return;
+          }
+
+        remaining = GOODIX_550C_APP_FIRMWARE_LEN - off;
+        goodix_cmd_write_firmware (
+            ssm, dev, off, goodix_550c_app_firmware + off,
+            MIN (GOODIX_550C_FW_CHUNK, remaining), GOODIX_550C_FW_NUMBER);
+      }
+      break;
+
+    case GOODIX_HEAL_WRITE_FW_NEXT:
+      {
+        g_autoptr(GError) error = NULL;
+
+        if (!goodix_cmd_parse_write_firmware_reply (dev, &error))
+          {
+            fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
+            return;
+          }
+
+        self->heal_fw_offset += GOODIX_550C_FW_CHUNK;
+        fpi_ssm_jump_to_state (ssm, GOODIX_HEAL_WRITE_FW_SEND);
+      }
+      break;
+
+    case GOODIX_HEAL_CHECK_FW:
+      fp_info ("Self-heal: validating firmware (commits target PSK)");
+      goodix_cmd_check_firmware (ssm, dev, self->heal_fw_hmac);
+      break;
+
+    case GOODIX_HEAL_RESET_MCU:
+      {
+        g_autoptr(GError) error = NULL;
+
+        if (!goodix_cmd_parse_check_firmware_reply (dev, &error))
+          {
+            fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
+            return;
+          }
+
+        fp_info ("Self-heal: PSK committed; resetting into app");
+        goodix_cmd_mcu_reset_soft (ssm, dev);
+      }
+      break;
+
+    case GOODIX_HEAL_RESET_SETTLE:
+      /* Let the device re-enumerate into the app, then finish. The fresh open
+       * (started by the done handler) does its own USB reset + claim. */
+      fpi_ssm_next_state_delayed (ssm, GOODIX_550C_REENUM_SETTLE_MS);
+      break;
+
+    case GOODIX_HEAL_NUM_STATES:
+      g_assert_not_reached ();
+      break;
+    }
+}
+
+static void
+goodix_heal_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpiDeviceGoodix53x5 *self = FPI_DEVICE_GOODIX53X5 (dev);
+
+  self->task_ssm = NULL;
+  g_clear_pointer (&self->heal_container, g_free);
+
+  if (error)
+    {
+      fp_warn ("Self-heal provisioning failed: %s", error->message);
+      goodix_cleanup_failed_open (dev);
+      fpi_device_open_complete (dev, error);
+      return;
+    }
+
+  /* Provisioning succeeded. The IAP->APP soft reset re-enumerates the sensor on
+   * the USB bus with a new address (a USB-level reset alone does NOT jump IAP to
+   * APP — only the reset command does, and it always re-enumerates), so this
+   * FpDevice's USB handle is now stale and cannot be reused in place. Report the
+   * device as removed and clean up; the re-enumerated sensor — now on the
+   * all-zero PSK — reappears as a fresh device that opens normally. fprintd
+   * picks up the hotplugged device automatically; a CLI caller just re-runs. */
+  fp_info ("Self-heal: sensor reprovisioned to the all-zero PSK and "
+           "re-enumerated on the USB bus; re-open to use it");
+  goodix_cleanup_failed_open (dev);
+  fpi_device_open_complete (
+      dev,
+      fpi_device_error_new_msg (
+          FP_DEVICE_ERROR_REMOVED,
+          "Sensor was reprovisioned to the default PSK and re-enumerated; "
+          "please retry"));
+}
+
+/*
+ * Start the self-heal provisioning SSM. Ownership of the open completion passes
+ * to this SSM: on success it re-runs the open, on failure it completes the open
+ * with the error. Returns TRUE if started (caller must not touch the open).
+ */
+static gboolean
+goodix_maybe_start_selfheal (FpDevice *dev)
+{
+  FpiDeviceGoodix53x5 *self = FPI_DEVICE_GOODIX53X5 (dev);
+  guint8 expected[32];
+  FpiSsm *ssm;
+
+  if (self->variant != GOODIX_VARIANT_TLS_PSK)
+    return FALSE;
+  /* Only when the handshake itself failed, never after it already succeeded. */
+  if (!self->open_reached_tls || self->tls_handshake_done)
+    return FALSE;
+  if (self->selfheal_attempted)
+    return FALSE;
+  if (goodix_550c_has_psk_override ())
+    {
+      fp_info ("TLS-PSK handshake failed but a PSK override is configured; "
+               "not reprovisioning (the unit is deliberately on a custom PSK)");
+      return FALSE;
+    }
+
+  /* Derive the target (all-zero) check_firmware HMAC and self-check it against
+   * the verified constant before we touch the device — a mismatch means the
+   * embedded firmware or the derivation is wrong, so refuse to reflash. */
+  goodix_550c_fw_hmac (goodix_psk, GOODIX_PSK_LEN,
+                       goodix_550c_app_firmware, GOODIX_550C_APP_FIRMWARE_LEN,
+                       expected);
+  if (memcmp (expected, goodix_550c_allzero_fw_hmac, 32) != 0)
+    {
+      fp_warn ("Self-heal aborted: firmware HMAC self-check failed "
+               "(embedded firmware or key derivation is corrupt)");
+      return FALSE;
+    }
+
+  fp_warn ("550c TLS-PSK handshake failed and no PSK override is set — "
+           "self-healing: reprovisioning the sensor to the all-zero PSK");
+
+  self->selfheal_attempted = TRUE;
+  self->heal_erased = FALSE;
+  self->heal_fw_offset = 0;
+  memcpy (self->heal_fw_hmac, expected, 32);
+  g_clear_pointer (&self->heal_container, g_free);
+  self->heal_container = goodix_550c_build_container ();
+  self->heal_container_len = GOODIX_550C_CONTAINER_LEN;
+
+  ssm = fpi_ssm_new (dev, goodix_heal_ssm_handler, GOODIX_HEAL_NUM_STATES);
+  self->task_ssm = ssm;
+  fpi_ssm_start (ssm, goodix_heal_ssm_done);
+  return TRUE;
+}
+
 static void
 goodix_cleanup_failed_open (FpDevice *dev)
 {
@@ -771,6 +1266,15 @@ goodix_open_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
     {
       fp_warn ("Device open failed: %s", error->message);
 
+      /* A 550c that failed the all-zero handshake with no PSK override is
+       * likely still on a per-machine PSK. Try to reprovision it to all-zero
+       * and re-open. When this takes over, it owns the open completion. */
+      if (goodix_maybe_start_selfheal (dev))
+        {
+          g_error_free (error);
+          return;
+        }
+
       goodix_cleanup_failed_open (dev);
       fpi_device_open_complete (dev, error);
       return;
@@ -781,13 +1285,15 @@ goodix_open_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
   fpi_device_open_complete (dev, NULL);
 }
 
-void
-goodix_start_open_ssm (FpDevice *dev)
+static void
+goodix_launch_open_ssm (FpDevice *dev)
 {
   FpiDeviceGoodix53x5 *self = FPI_DEVICE_GOODIX53X5 (dev);
   FpiSsm *ssm;
 
   self->variant = (GoodixVariant) fpi_device_get_driver_data (dev);
+  self->open_reached_tls = FALSE;
+  self->tls_handshake_done = FALSE;
 
   /* USB interface + bulk endpoints differ between the 53x5 and the 550c. */
   if (self->variant == GOODIX_VARIANT_TLS_PSK)
@@ -807,6 +1313,16 @@ goodix_start_open_ssm (FpDevice *dev)
                       GOODIX_OPEN_NUM_STATES);
   self->task_ssm = ssm;
   fpi_ssm_start (ssm, goodix_open_ssm_done);
+}
+
+void
+goodix_start_open_ssm (FpDevice *dev)
+{
+  FpiDeviceGoodix53x5 *self = FPI_DEVICE_GOODIX53X5 (dev);
+
+  /* Fresh open: allow self-heal to run once if the handshake fails. */
+  self->selfheal_attempted = FALSE;
+  goodix_launch_open_ssm (dev);
 }
 
 /* ========================================================================

@@ -56,6 +56,7 @@ goodix_close (FpDevice *dev)
   g_clear_pointer (&self->reference_image, g_free);
   g_clear_pointer (&self->captured_image, g_free);
   g_clear_pointer (&self->enroll_features, g_ptr_array_unref);
+  g_clear_pointer (&self->heal_container, g_free);
   g_clear_pointer (&self->tls, goodix_tls_free);
 
   if (self->cmd)

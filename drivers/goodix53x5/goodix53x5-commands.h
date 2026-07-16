@@ -94,6 +94,32 @@ void goodix_cmd_set_sleep_mode (FpiSsm *ssm, FpDevice *dev);
 /* Switch sensor EC power on or off. Expects data (success flag). */
 void goodix_cmd_ec_control (FpiSsm *ssm, FpDevice *dev, gboolean on);
 
+/* ------------------------------------------------------------------------
+ * IAP / provisioning commands (550c self-heal). See goodix53x5-session.c.
+ * ------------------------------------------------------------------------ */
+
+/* Erase the app to drop into IAP. ACK only (device re-enumerates after). */
+void goodix_cmd_mcu_erase_app (FpiSsm *ssm, FpDevice *dev);
+
+/* Write one offset-chunk of the PSK container. Expects data (status byte). */
+void goodix_cmd_preset_psk_write_chunk (FpiSsm *ssm, FpDevice *dev,
+                                        guint32 total_len, guint32 chunk_len,
+                                        guint32 offset, const guint8 *chunk);
+
+/* Write one firmware chunk at @offset (@number is the 550c's extra field, =2).
+ * Expects data (status byte). */
+void goodix_cmd_write_firmware (FpiSsm *ssm, FpDevice *dev,
+                                guint32 offset, const guint8 *data,
+                                gsize data_len, guint32 number);
+
+/* Validate the reflashed app against a 32-byte PSK-derived HMAC. Expects data
+ * (status byte). */
+void goodix_cmd_check_firmware (FpiSsm *ssm, FpDevice *dev,
+                                const guint8 *hmac32);
+
+/* Soft-reset the MCU back into the app. ACK only (device re-enumerates). */
+void goodix_cmd_mcu_reset_soft (FpiSsm *ssm, FpDevice *dev);
+
 /* ========================================================================
  * Named reply parsers
  *
@@ -124,6 +150,14 @@ gboolean goodix_cmd_parse_production_read_reply (FpDevice      *dev,
 gboolean goodix_cmd_parse_production_write_reply (FpDevice      *dev,
                                                   const guint8 **out_payload,
                                                   gsize         *out_payload_len);
+
+/* IAP reply parsers: TRUE on success, else FALSE with @error set. */
+gboolean goodix_cmd_parse_preset_psk_write_reply (FpDevice *dev,
+                                                  GError  **error);
+gboolean goodix_cmd_parse_write_firmware_reply (FpDevice *dev,
+                                                GError  **error);
+gboolean goodix_cmd_parse_check_firmware_reply (FpDevice *dev,
+                                                GError  **error);
 
 gboolean goodix_cmd_parse_mcu_reply (FpDevice      *dev,
                                      guint32        expected_type,

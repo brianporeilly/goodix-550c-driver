@@ -273,8 +273,153 @@ goodix_cmd_ec_control (FpiSsm *ssm, FpDevice *dev, gboolean on)
 }
 
 /* ========================================================================
+ * IAP / provisioning commands (550c self-heal)
+ *
+ * These drive the in-application-programming path used to (re)provision the
+ * 550c to the all-zero PSK: erase the app to enter IAP, write the PSK
+ * container, reflash the app firmware, validate it, and reset back to the
+ * app. Framing mirrors the reference Python tooling (goodix-fp-dump goodix.py
+ * and the RE repo's provision_container_allzero.py). See goodix53x5-session.c
+ * for the sequencing.
+ * ======================================================================== */
+
+void
+goodix_cmd_mcu_erase_app (FpiSsm *ssm, FpDevice *dev)
+{
+  /* mcu_erase_app (0xA4): payload = 0x00 | sleep_time(0). ACK only — the
+   * device drops off the bus and re-enumerates into IAP immediately, so no
+   * data reply is awaited (reply=False in the reference). */
+  guint8 payload[2] = { 0x00, 0x00 };
+
+  goodix_run_cmd (ssm, dev, 0xA, 0x2, payload, 2, FALSE);
+}
+
+void
+goodix_cmd_preset_psk_write_chunk (FpiSsm *ssm, FpDevice *dev,
+                                   guint32 total_len, guint32 chunk_len,
+                                   guint32 offset, const guint8 *chunk)
+{
+  /* preset_psk_write (0xE0), offset-chunked form:
+   *   payload = total_len(LE) | chunk_len(LE) | offset(LE) | chunk.
+   * On the 550c this must carry the full Windows-style container (both PSK
+   * slots); a bare single-slot write is accepted but never commits. Reply is
+   * a one-byte status (0x00 = accepted). */
+  gsize payload_len = 12 + chunk_len;
+  g_autofree guint8 *payload = g_malloc (payload_len);
+
+  goodix_encode_u32_le (payload, total_len);
+  goodix_encode_u32_le (payload + 4, chunk_len);
+  goodix_encode_u32_le (payload + 8, offset);
+  memcpy (payload + 12, chunk, chunk_len);
+
+  goodix_run_cmd (ssm, dev, 0xE, 0x0, payload, payload_len, TRUE);
+}
+
+void
+goodix_cmd_write_firmware (FpiSsm *ssm, FpDevice *dev,
+                           guint32 offset, const guint8 *data,
+                           gsize data_len, guint32 number)
+{
+  /* write_firmware (0xF0): payload = offset(LE) | len(LE) | number(LE) | data.
+   * The 550c IAP requires the extra `number` field (=2); an incorrectly
+   * framed write wedges the USB stack (cold-boot recovery only). Reply is a
+   * one-byte status (0x01 = ok). */
+  gsize payload_len = 12 + data_len;
+  g_autofree guint8 *payload = g_malloc (payload_len);
+
+  goodix_encode_u32_le (payload, offset);
+  goodix_encode_u32_le (payload + 4, (guint32) data_len);
+  goodix_encode_u32_le (payload + 8, number);
+  memcpy (payload + 12, data, data_len);
+
+  goodix_run_cmd (ssm, dev, 0xF, 0x0, payload, payload_len, TRUE);
+}
+
+void
+goodix_cmd_check_firmware (FpiSsm *ssm, FpDevice *dev, const guint8 *hmac32)
+{
+  /* check_firmware (0xF4), HMAC-only form: the 550c IAP validates the freshly
+   * written app against a 32-byte PSK-derived HMAC alone (no offset/len/crc32,
+   * unlike the 53x5 family). Reply is a one-byte status (0x01 = ok). */
+  goodix_run_cmd (ssm, dev, 0xF, 0x2, hmac32, 32, TRUE);
+}
+
+void
+goodix_cmd_mcu_reset_soft (FpiSsm *ssm, FpDevice *dev)
+{
+  /* reset (0xA2) with reset_sensor=False, soft_reset_mcu=True, sleep_time=20:
+   * reset byte = soft_reset_mcu<<1 = 0x02. With soft_reset_mcu set the device
+   * re-enumerates into the app and returns no data reply — ACK only. */
+  guint8 payload[2] = { 0x02, 20 };
+
+  goodix_run_cmd (ssm, dev, 0xA, 0x1, payload, 2, FALSE);
+}
+
+/* ========================================================================
  * Named reply parsers
  * ======================================================================== */
+
+gboolean
+goodix_cmd_parse_preset_psk_write_reply (FpDevice *dev, GError **error)
+{
+  const guint8 *payload;
+  gsize payload_len;
+
+  if (!goodix_parse_reply_exact (dev, 0xE, 0x0, &payload, &payload_len, error))
+    return FALSE;
+
+  /* preset_psk_write reports success with status byte 0x00. */
+  if (payload_len < 1 || payload[0] != 0x00)
+    {
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                   "PSK container write rejected (status 0x%02x)",
+                   payload_len ? payload[0] : 0xff);
+      return FALSE;
+    }
+
+  return TRUE;
+}
+
+gboolean
+goodix_cmd_parse_write_firmware_reply (FpDevice *dev, GError **error)
+{
+  const guint8 *payload;
+  gsize payload_len;
+
+  if (!goodix_parse_reply_exact (dev, 0xF, 0x0, &payload, &payload_len, error))
+    return FALSE;
+
+  if (payload_len < 1 || payload[0] != 0x01)
+    {
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                   "Firmware write rejected (status 0x%02x)",
+                   payload_len ? payload[0] : 0xff);
+      return FALSE;
+    }
+
+  return TRUE;
+}
+
+gboolean
+goodix_cmd_parse_check_firmware_reply (FpDevice *dev, GError **error)
+{
+  const guint8 *payload;
+  gsize payload_len;
+
+  if (!goodix_parse_reply_exact (dev, 0xF, 0x2, &payload, &payload_len, error))
+    return FALSE;
+
+  if (payload_len < 1 || payload[0] != 0x01)
+    {
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                   "Firmware check failed (status 0x%02x) — the container "
+                   "write did not commit the target PSK",
+                   payload_len ? payload[0] : 0xff);
+      return FALSE;
+    }
+
+  return TRUE;
+}
 
 gboolean
 goodix_cmd_parse_fw_version_reply (FpDevice      *dev,
