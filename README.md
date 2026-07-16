@@ -26,9 +26,13 @@ Everything else is the AndyHazz driver with variant branches added.
 - ✅ **Enroll works**: 8-stage enroll completes, SIGFM template stored.
 - ✅ **Verify works**: enrolled finger matches (SIGFM scores in the thousands vs
   a 150 threshold); a different finger is correctly rejected (score 0).
+- ✅ **Automatic self-heal**: a unit still on a Windows-provisioned PSK is
+  reprovisioned to the all-zero PSK on first open, with no manual steps (see
+  [Automatic self-heal](#automatic-self-heal)).
 
-Verified end-to-end on real hardware against a 550c reprovisioned to the
-all-zero PSK, driving libfprint's own `enroll` / `verify` example tools.
+Verified end-to-end on real hardware, including through `fprintd`
+(`fprintd-enroll` / `fprintd-verify`): the self-heal reprovisions a unit from a
+Windows PSK to all-zero on first open, and enroll/verify then work normally.
 
 ## The PSK — reprovisioned to all-zero
 
@@ -51,6 +55,43 @@ recovered value (until it is reprovisioned) via either:
 
 See `drivers/goodix53x5/goodix53x5-session.c` (`goodix_550c_load_psk`) and the
 RE repo for how to recover a per-machine PSK and, preferably, reprovision.
+
+### Automatic self-heal
+
+You normally don't reprovision by hand. When the all-zero TLS-PSK handshake
+fails on open **and no PSK override is set**, the driver assumes the unit is
+still on a Windows-provisioned PSK and self-heals: it reprovisions the sensor to
+the all-zero PSK, then the sensor is usable on every subsequent open. A unit
+pinned to a recovered PSK (via the env var or config file) is left untouched —
+self-heal only runs on the default path.
+
+Before reflashing, the driver reads the sensor's PSK hash slot to decide what is
+actually wrong:
+
+- **Hash is a non-default PSK** → full reprovision: erase to the IAP bootloader,
+  write the all-zero PSK container, reflash the app firmware, and commit. The
+  IAP→app reset **re-enumerates the sensor on the USB bus**, so the open that
+  triggered the heal completes with a "device removed / please retry" error.
+  fprintd picks up the hotplugged sensor and reopens automatically; a CLI caller
+  just runs the command again. This happens **once** per unit — thereafter the
+  handshake succeeds directly.
+- **Hash is already all-zero** → the PSK is correct and the handshake failure was
+  transient (a freshly-reflashed sensor can fail its first handshake once). The
+  driver **skips the reflash** and retries the open in place. No firmware writes.
+
+All heal steps, including the live hash-slot value, are logged at warning level,
+so `journalctl -u fprintd` shows exactly what happened, e.g.:
+
+```
+550c TLS-PSK handshake failed and no PSK override is set — self-healing: …
+Self-heal: live PSK hash slot = 40258d6a… (32 bytes)
+Self-heal: sensor is on a non-default PSK; reprovisioning it to the all-zero PSK
+…
+Self-heal: sensor reprovisioned to the all-zero PSK and re-enumerated …
+```
+
+Implementation: the heal state machine in `goodix53x5-session.c`
+(`goodix_heal_ssm_handler`, armed from `goodix_maybe_start_selfheal`).
 
 ## Build (into a libfprint v1.94.10 tree)
 

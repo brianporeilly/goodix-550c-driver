@@ -787,6 +787,7 @@ goodix_open_ssm_handler (FpiSsm   *ssm,
  * ======================================================================== */
 
 static void goodix_cleanup_failed_open (FpDevice *dev);
+static void goodix_launch_open_ssm (FpDevice *dev);
 
 /* Container geometry (bytes). */
 #define GOODIX_550C_CONTAINER_PREFIX_LEN 10
@@ -943,7 +944,9 @@ goodix_heal_reset_and_claim (FpDevice *dev, GError **error)
 }
 
 typedef enum {
-  GOODIX_HEAL_READ_FW_VERSION = 0,
+  GOODIX_HEAL_READ_PSK_HASH = 0,
+  GOODIX_HEAL_DECIDE_PSK,
+  GOODIX_HEAL_READ_FW_VERSION,
   GOODIX_HEAL_DECIDE_MODE,
   GOODIX_HEAL_ERASE_APP,
   GOODIX_HEAL_ERASE_SETTLE,
@@ -968,6 +971,58 @@ goodix_heal_ssm_handler (FpiSsm   *ssm,
 
   switch (state)
     {
+    case GOODIX_HEAL_READ_PSK_HASH:
+      /* Before touching anything, read the SHA256(PSK) hash slot (0xbb020001).
+       * This is the same read check_psk.py uses and it works in a freshly-booted
+       * app. It lets us tell a genuinely wrong PSK (reflash needed) from a device
+       * that is already on the all-zero PSK but failed the handshake transiently
+       * (no reflash needed — just retry). Best-effort: a read-gated reply falls
+       * through to the reflash path. */
+      goodix_cmd_preset_psk_read (ssm, dev, 0xbb020001, 32, 0);
+      break;
+
+    case GOODIX_HEAL_DECIDE_PSK:
+      {
+        g_autoptr(GError) error = NULL;
+        const guint8 *hash;
+        gsize hash_len;
+        guint8 expected[32];
+        gsize expected_len = sizeof (expected);
+        g_autoptr(GChecksum) sha = g_checksum_new (G_CHECKSUM_SHA256);
+
+        if (!goodix_cmd_parse_preset_psk_read_reply (dev, &hash, &hash_len,
+                                                     &error))
+          {
+            fp_warn ("Self-heal: could not read the PSK hash slot (%s); "
+                     "proceeding with a full reprovision", error->message);
+            fpi_ssm_jump_to_state (ssm, GOODIX_HEAL_READ_FW_VERSION);
+            return;
+          }
+
+        g_checksum_update (sha, goodix_psk, GOODIX_PSK_LEN);
+        g_checksum_get_digest (sha, expected, &expected_len);
+
+        fp_warn ("Self-heal: live PSK hash slot = %02x%02x%02x%02x… (%zu bytes)",
+                 hash_len > 0 ? hash[0] : 0, hash_len > 1 ? hash[1] : 0,
+                 hash_len > 2 ? hash[2] : 0, hash_len > 3 ? hash[3] : 0,
+                 hash_len);
+
+        if (hash_len >= 32 && memcmp (hash, expected, 32) == 0)
+          {
+            fp_warn ("Self-heal: sensor is ALREADY on the all-zero PSK — the "
+                     "handshake failure was transient, NOT a wrong PSK; "
+                     "skipping the reflash and retrying the open");
+            self->heal_already_provisioned = TRUE;
+            fpi_ssm_mark_completed (ssm);
+            return;
+          }
+
+        fp_warn ("Self-heal: sensor is on a non-default PSK; reprovisioning it "
+                 "to the all-zero PSK");
+        fpi_ssm_jump_to_state (ssm, GOODIX_HEAL_READ_FW_VERSION);
+      }
+      break;
+
     case GOODIX_HEAL_READ_FW_VERSION:
       goodix_cmd_read_fw_version (ssm, dev);
       break;
@@ -987,7 +1042,7 @@ goodix_heal_ssm_handler (FpiSsm   *ssm,
 
         ver = g_strndup ((const gchar *) pl,
                          strnlen ((const gchar *) pl, pl_len));
-        fp_info ("Self-heal: device firmware '%s'", ver);
+        fp_warn ("Self-heal: device firmware '%s'", ver);
 
         if (strstr (ver, "IAP") != NULL)
           {
@@ -1008,7 +1063,7 @@ goodix_heal_ssm_handler (FpiSsm   *ssm,
       break;
 
     case GOODIX_HEAL_ERASE_APP:
-      fp_info ("Self-heal: erasing app to enter IAP");
+      fp_warn ("Self-heal: erasing app to enter IAP");
       self->heal_erased = TRUE;
       goodix_cmd_mcu_erase_app (ssm, dev);
       break;
@@ -1032,7 +1087,7 @@ goodix_heal_ssm_handler (FpiSsm   *ssm,
       break;
 
     case GOODIX_HEAL_CONTAINER_WRITE1:
-      fp_info ("Self-heal: writing PSK container (chunk 1/2)");
+      fp_warn ("Self-heal: writing PSK container (chunk 1/2)");
       goodix_cmd_preset_psk_write_chunk (ssm, dev, GOODIX_550C_CONTAINER_LEN,
                                          GOODIX_550C_FW_CHUNK, 0,
                                          self->heal_container);
@@ -1048,7 +1103,7 @@ goodix_heal_ssm_handler (FpiSsm   *ssm,
             return;
           }
 
-        fp_info ("Self-heal: writing PSK container (chunk 2/2)");
+        fp_warn ("Self-heal: writing PSK container (chunk 2/2)");
         goodix_cmd_preset_psk_write_chunk (
             ssm, dev, GOODIX_550C_CONTAINER_LEN,
             GOODIX_550C_CONTAINER_LEN - GOODIX_550C_FW_CHUNK,
@@ -1067,7 +1122,7 @@ goodix_heal_ssm_handler (FpiSsm   *ssm,
             return;
           }
 
-        fp_info ("Self-heal: reflashing app firmware (%d bytes)",
+        fp_warn ("Self-heal: reflashing app firmware (%d bytes)",
                  GOODIX_550C_APP_FIRMWARE_LEN);
         self->heal_fw_offset = 0;
         fpi_ssm_jump_to_state (ssm, GOODIX_HEAL_WRITE_FW_SEND);
@@ -1108,7 +1163,7 @@ goodix_heal_ssm_handler (FpiSsm   *ssm,
       break;
 
     case GOODIX_HEAL_CHECK_FW:
-      fp_info ("Self-heal: validating firmware (commits target PSK)");
+      fp_warn ("Self-heal: validating firmware (commits target PSK)");
       goodix_cmd_check_firmware (ssm, dev, self->heal_fw_hmac);
       break;
 
@@ -1122,7 +1177,7 @@ goodix_heal_ssm_handler (FpiSsm   *ssm,
             return;
           }
 
-        fp_info ("Self-heal: PSK committed; resetting into app");
+        fp_warn ("Self-heal: PSK committed; resetting into app");
         goodix_cmd_mcu_reset_soft (ssm, dev);
       }
       break;
@@ -1155,6 +1210,36 @@ goodix_heal_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
       return;
     }
 
+  if (self->heal_already_provisioned)
+    {
+      /* The hash slot showed the sensor is already on the all-zero PSK, so no
+       * reflash ran and the device did NOT re-enumerate — the handshake failure
+       * was transient (the post-provision first-handshake quirk, or a wedged
+       * prior attempt). Drop the stale interface claim and re-run the open in
+       * place; the open SSM's leading USB reset clears the transient. Because
+       * selfheal_attempted stays TRUE, a second failure fails the open cleanly
+       * instead of triggering a needless reflash. */
+      GUsbDevice *usb = fpi_device_get_usb_device (dev);
+
+      self->heal_already_provisioned = FALSE;
+
+      if (self->usb_interface_claimed)
+        {
+          g_autoptr(GError) rel_err = NULL;
+
+          if (!g_usb_device_release_interface (usb, self->usb_interface, 0,
+                                               &rel_err))
+            fp_dbg ("Releasing interface before in-place reopen: %s",
+                    rel_err->message);
+          self->usb_interface_claimed = FALSE;
+        }
+
+      fp_warn ("Self-heal: retrying the open on the already-provisioned sensor "
+               "(no reflash)");
+      goodix_launch_open_ssm (dev);
+      return;
+    }
+
   /* Provisioning succeeded. The IAP->APP soft reset re-enumerates the sensor on
    * the USB bus with a new address (a USB-level reset alone does NOT jump IAP to
    * APP — only the reset command does, and it always re-enumerates), so this
@@ -1162,7 +1247,7 @@ goodix_heal_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
    * device as removed and clean up; the re-enumerated sensor — now on the
    * all-zero PSK — reappears as a fresh device that opens normally. fprintd
    * picks up the hotplugged device automatically; a CLI caller just re-runs. */
-  fp_info ("Self-heal: sensor reprovisioned to the all-zero PSK and "
+  fp_warn ("Self-heal: sensor reprovisioned to the all-zero PSK and "
            "re-enumerated on the USB bus; re-open to use it");
   goodix_cleanup_failed_open (dev);
   fpi_device_open_complete (
@@ -1213,10 +1298,12 @@ goodix_maybe_start_selfheal (FpDevice *dev)
     }
 
   fp_warn ("550c TLS-PSK handshake failed and no PSK override is set — "
-           "self-healing: reprovisioning the sensor to the all-zero PSK");
+           "self-healing: checking the PSK hash slot, then reprovisioning to "
+           "the all-zero PSK only if needed");
 
   self->selfheal_attempted = TRUE;
   self->heal_erased = FALSE;
+  self->heal_already_provisioned = FALSE;
   self->heal_fw_offset = 0;
   memcpy (self->heal_fw_hmac, expected, 32);
   g_clear_pointer (&self->heal_container, g_free);

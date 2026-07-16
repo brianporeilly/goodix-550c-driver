@@ -161,6 +161,7 @@ struct _FpiDeviceGoodix53x5
   gboolean open_reached_tls;    /* the open SSM entered the TLS-PSK handshake */
   gboolean selfheal_attempted;  /* self-heal ran once this open — do not loop */
   gboolean heal_erased;         /* app already erased once this heal attempt */
+  gboolean heal_already_provisioned; /* hash slot already == all-zero: skip reflash */
   guint32  heal_fw_offset;      /* running offset of the firmware reflash loop */
   guint8   heal_fw_hmac[32];    /* PSK-derived check_firmware HMAC (target PSK) */
   guint8  *heal_container;      /* assembled 446-byte PSK container */

@@ -98,6 +98,12 @@ void goodix_cmd_ec_control (FpiSsm *ssm, FpDevice *dev, gboolean on);
  * IAP / provisioning commands (550c self-heal). See goodix53x5-session.c.
  * ------------------------------------------------------------------------ */
 
+/* Read a PSK slot (0xE4). @flags selects the slot (e.g. 0xbb020001 = the
+ * SHA256(PSK) hash slot). Expects a data reply; parse with
+ * goodix_cmd_parse_preset_psk_read_reply. */
+void goodix_cmd_preset_psk_read (FpiSsm *ssm, FpDevice *dev,
+                                 guint32 flags, guint32 length, guint32 offset);
+
 /* Erase the app to drop into IAP. ACK only (device re-enumerates after). */
 void goodix_cmd_mcu_erase_app (FpiSsm *ssm, FpDevice *dev);
 
@@ -126,6 +132,13 @@ void goodix_cmd_mcu_reset_soft (FpiSsm *ssm, FpDevice *dev);
  * All returned payload pointers point into the current RX buffer and are
  * valid only until the next receive reset.
  * ======================================================================== */
+
+/* Parse a preset_psk_read (0xE4) reply. On success @out_data / @out_data_len
+ * point at the slot payload (e.g. the 32-byte SHA256(PSK) hash). */
+gboolean goodix_cmd_parse_preset_psk_read_reply (FpDevice      *dev,
+                                                 const guint8 **out_data,
+                                                 gsize         *out_data_len,
+                                                 GError       **error);
 
 gboolean goodix_cmd_parse_fw_version_reply (FpDevice      *dev,
                                             const guint8 **out_payload,

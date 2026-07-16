@@ -284,6 +284,24 @@ goodix_cmd_ec_control (FpiSsm *ssm, FpDevice *dev, gboolean on)
  * ======================================================================== */
 
 void
+goodix_cmd_preset_psk_read (FpiSsm *ssm, FpDevice *dev,
+                            guint32 flags, guint32 length, guint32 offset)
+{
+  /* preset_psk_read (0xE4 = category 0xE, command 0x2): read a PSK slot.
+   * Payload = length(LE) | offset(LE) | flags(LE) | 0(LE). Shares the wire
+   * command with the 53x5 production_read but uses this distinct 550c payload
+   * layout (see goodix_cmd_parse_preset_psk_read_reply). Expects a data reply. */
+  guint8 payload[16];
+
+  goodix_encode_u32_le (payload, length);
+  goodix_encode_u32_le (payload + 4, offset);
+  goodix_encode_u32_le (payload + 8, flags);
+  goodix_encode_u32_le (payload + 12, 0);
+
+  goodix_run_cmd (ssm, dev, 0xE, 0x2, payload, sizeof (payload), TRUE);
+}
+
+void
 goodix_cmd_mcu_erase_app (FpiSsm *ssm, FpDevice *dev)
 {
   /* mcu_erase_app (0xA4): payload = 0x00 | sleep_time(0). ACK only — the
@@ -418,6 +436,49 @@ goodix_cmd_parse_check_firmware_reply (FpDevice *dev, GError **error)
       return FALSE;
     }
 
+  return TRUE;
+}
+
+gboolean
+goodix_cmd_parse_preset_psk_read_reply (FpDevice      *dev,
+                                        const guint8 **out_data,
+                                        gsize         *out_data_len,
+                                        GError       **error)
+{
+  const guint8 *payload;
+  gsize payload_len;
+  guint32 data_len;
+
+  if (!goodix_parse_reply_exact (dev, 0xE, 0x2, &payload, &payload_len, error))
+    return FALSE;
+
+  /* Reply layout: status(1) | flags(4 LE) | data_len(4 LE) | data. */
+  if (payload_len < 1 || payload[0] != 0x00)
+    {
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                   "PSK slot read rejected (status 0x%02x)",
+                   payload_len ? payload[0] : 0xff);
+      return FALSE;
+    }
+
+  if (payload_len < 9)
+    {
+      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                           "PSK slot read reply too short");
+      return FALSE;
+    }
+
+  data_len = (guint32) payload[5] | ((guint32) payload[6] << 8) |
+             ((guint32) payload[7] << 16) | ((guint32) payload[8] << 24);
+  if (payload_len - 9 < data_len)
+    {
+      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                           "PSK slot read reply shorter than its length field");
+      return FALSE;
+    }
+
+  *out_data = payload + 9;
+  *out_data_len = data_len;
   return TRUE;
 }
 
