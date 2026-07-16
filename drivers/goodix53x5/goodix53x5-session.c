@@ -71,14 +71,20 @@ typedef enum {
 } GoodixOpenState;
 
 
-/* All-zero PSK */
+/*
+ * All-zero PSK. The 550c is provisioned to this value (see the reverse-
+ * engineering repo's provisioning tooling), matching the rest of the Goodix
+ * 51x0/52xd/55x4 family. It is the default, so a provisioned unit is fully
+ * plug-and-play with no configuration.
+ */
 static const guint8 goodix_psk[GOODIX_PSK_LEN] = { 0 };
 
 /*
- * The 550c PSK is provisioned per-unit (DPAPI-wrapped in the sensor) and cannot
- * be derived, so it is NOT hard-coded. The user supplies their recovered PSK
- * via the GOODIX550C_PSK environment variable (64 hex chars) or the file
- * /etc/goodix550c.psk. See the driver README for how to recover it.
+ * A unit still on its factory (Windows-provisioned, DPAPI-wrapped) per-machine
+ * PSK can override the all-zero default with its recovered value via the
+ * GOODIX550C_PSK environment variable (64 hex chars) or the file
+ * /etc/goodix550c.psk. See the driver README for how to recover and, preferably,
+ * how to reprovision the sensor to the all-zero PSK instead.
  */
 #define GOODIX_550C_PSK_FILE "/etc/goodix550c.psk"
 
@@ -93,20 +99,11 @@ goodix_550c_load_psk (guint8   out[GOODIX_PSK_LEN],
     {
       hex = g_strdup (env);
     }
-  else
+  else if (!g_file_get_contents (GOODIX_550C_PSK_FILE, &hex, NULL, NULL))
     {
-      g_autofree gchar *contents = NULL;
-
-      if (!g_file_get_contents (GOODIX_550C_PSK_FILE, &contents, NULL, NULL))
-        {
-          g_set_error_literal (error, FP_DEVICE_ERROR,
-                               FP_DEVICE_ERROR_NOT_SUPPORTED,
-                               "No 550c PSK configured: set GOODIX550C_PSK or "
-                               "create " GOODIX_550C_PSK_FILE " (64 hex chars). "
-                               "See the driver README to recover your PSK.");
-          return FALSE;
-        }
-      hex = g_steal_pointer (&contents);
+      /* No override configured: use the provisioned all-zero PSK. */
+      memcpy (out, goodix_psk, GOODIX_PSK_LEN);
+      return TRUE;
     }
 
   g_strstrip (hex);

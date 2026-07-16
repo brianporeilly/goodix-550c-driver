@@ -12,8 +12,15 @@ set -euo pipefail
 
 LIBFPRINT_DIR="${1:?Usage: $0 /path/to/libfprint}"
 
-if [ ! -f "$LIBFPRINT_DIR/libfprint/meson.build" ]; then
+# A libfprint repo root has BOTH a top-level meson.build (the project) and a
+# libfprint/meson.build (the library subdir). Requiring both avoids the easy
+# off-by-one where you point one level too high (at a dir that merely *contains*
+# a checkout named "libfprint") — there, only libfprint/meson.build exists and a
+# looser check would silently install into a dead directory.
+if [ ! -f "$LIBFPRINT_DIR/meson.build" ] || [ ! -f "$LIBFPRINT_DIR/libfprint/meson.build" ]; then
     echo "Error: $LIBFPRINT_DIR does not look like a libfprint source tree."
+    echo "       Pass the libfprint checkout itself (it must contain both"
+    echo "       meson.build and libfprint/meson.build)."
     exit 1
 fi
 

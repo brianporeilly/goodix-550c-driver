@@ -13,7 +13,7 @@ that this fork adds as a device *variant* (selected from the USB id_table):
 |---|---|---|
 | Transport framing | bare messages, continuation markers | extra **pack layer** `0xA0/0xB0/0xB2`, raw 64-byte chunks |
 | Secure channel | custom GTLS (PRF + GEA/AES) | **standard TLS 1.2-PSK** (in-driver OpenSSL memory BIOs) |
-| PSK | all-zero PSK written to sensor | factory **per-machine PSK** (baked in; see below) |
+| PSK | all-zero PSK written to sensor | **all-zero PSK** once reprovisioned (see below) |
 | USB | interface 1, EP 0x03/0x81 | interface **0**, EP **0x01/0x83** |
 
 New files: `drivers/goodix53x5/goodix53x5-tls.c` / `.h` (the TLS-PSK engine).
@@ -22,15 +22,33 @@ Everything else is the AndyHazz driver with variant branches added.
 ## Status
 
 - ✅ **Device open works on real hardware**: init, TLS-PSK handshake, config
-  upload, sleep — `fp_device_open_sync` returns OK.
-- ⏳ Enroll / verify (scan + image capture + SIGFM) — in progress.
+  upload, sleep.
+- ✅ **Enroll works**: 8-stage enroll completes, SIGFM template stored.
+- ✅ **Verify works**: enrolled finger matches (SIGFM scores in the thousands vs
+  a 150 threshold); a different finger is correctly rejected (score 0).
 
-## The PSK is machine-specific
+Verified end-to-end on real hardware against a 550c reprovisioned to the
+all-zero PSK, driving libfprint's own `enroll` / `verify` example tools.
 
-The 550c stores its PSK DPAPI-wrapped in the sensor; Windows decrypts it at
-runtime. `goodix_550c_psk` in `drivers/goodix53x5/goodix53x5-session.c` holds
-the value recovered from **one specific laptop**. Other 550c units must recover
-their own PSK (see the reverse-engineering repo) and replace that constant.
+## The PSK — reprovisioned to all-zero
+
+Out of the factory the 550c stores a **per-machine** PSK DPAPI-wrapped in the
+sensor, which Windows decrypts at runtime. The reverse-engineering repo
+established that the sensor can be **reprovisioned from Linux to the same
+all-zero PSK the rest of the Goodix 51x0/52xd/55x4 family uses** (write the
+family white-box to the PSK slot inside a container write, then reflash — see
+`provision_container_allzero.py` in the RE repo). Once reprovisioned, the sensor
+is fully plug-and-play: this driver **defaults to the all-zero PSK** and needs no
+configuration.
+
+A unit still on its factory per-machine PSK can override the default with its
+recovered value (until it is reprovisioned) via either:
+
+- the `GOODIX550C_PSK` environment variable (64 hex chars), or
+- the file `/etc/goodix550c.psk` (64 hex chars).
+
+See `drivers/goodix53x5/goodix53x5-session.c` (`goodix_550c_load_psk`) and the
+RE repo for how to recover a per-machine PSK and, preferably, reprovision.
 
 ## Build (into a libfprint v1.94.10 tree)
 
