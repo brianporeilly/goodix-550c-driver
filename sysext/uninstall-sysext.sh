@@ -5,7 +5,7 @@ set -e
 [ "$(id -u)" -eq 0 ] || { echo "Run with sudo."; exit 1; }
 
 systemd-sysext unmerge 2>/dev/null || true
-rm -rf /var/lib/extensions/goodix550c-fp
+rm -rf /var/lib/extensions/goodix550c-fp /run/extensions/goodix550c-fp
 systemctl restart fprintd 2>/dev/null || true
 pkill -f fprintd 2>/dev/null || true
 
