@@ -16,8 +16,21 @@ that this fork adds as a device *variant* (selected from the USB id_table):
 | PSK | all-zero PSK written to sensor | **all-zero PSK** once reprovisioned (see below) |
 | USB | interface 1, EP 0x03/0x81 | interface **0**, EP **0x01/0x83** |
 
-New files: `drivers/goodix53x5/goodix53x5-tls.c` / `.h` (the TLS-PSK engine).
-Everything else is the AndyHazz driver with variant branches added.
+New files: `drivers/goodix53x5/goodix53x5-tls.c` / `.h` (the TLS-PSK engine) and
+`goodix53x5-firmware550c.c` / `.h` (the application-image loader used by
+self-heal). Everything else is the AndyHazz driver with variant branches added.
+
+## Licensing
+
+The driver code is LGPL-2.1-or-later, matching its parent
+[AndyHazz/goodix53x5-libfprint] and the goodix-fp-linux-dev work both derive
+from.
+
+This repo contains **no vendor firmware**. The Goodix 550c application image
+that self-heal reflashes is Goodix's proprietary, signed firmware; this project
+holds no right to redistribute it, so it is loaded at runtime from a file the
+machine's owner supplies. See
+[Supplying the 550c application firmware](#supplying-the-550c-application-firmware).
 
 ## Status
 
@@ -27,8 +40,10 @@ Everything else is the AndyHazz driver with variant branches added.
 - ✅ **Verify works**: enrolled finger matches (SIGFM scores in the thousands vs
   a 150 threshold); a different finger is correctly rejected (score 0).
 - ✅ **Automatic self-heal**: a unit still on a Windows-provisioned PSK is
-  reprovisioned to the all-zero PSK on first open, with no manual steps (see
-  [Automatic self-heal](#automatic-self-heal)).
+  reprovisioned to the all-zero PSK on first open, with no manual steps — once
+  the vendor application image is present locally (see
+  [Supplying the 550c application firmware](#supplying-the-550c-application-firmware)
+  and [Automatic self-heal](#automatic-self-heal)).
 
 Verified end-to-end on real hardware, including through `fprintd`
 (`fprintd-enroll` / `fprintd-verify`): the self-heal reprovisions a unit from a
@@ -56,14 +71,56 @@ recovered value (until it is reprovisioned) via either:
 See `drivers/goodix53x5/goodix53x5-session.c` (`goodix_550c_load_psk`) and the
 RE repo for how to recover a per-machine PSK and, preferably, reprovision.
 
+## Supplying the 550c application firmware
+
+Reprovisioning the PSK requires erasing the sensor's application firmware to
+reach IAP mode, which means a valid application image has to be written back
+afterwards. That image is **Goodix's proprietary, signed firmware**. It is not
+part of this driver, is not covered by this driver's licence, and **is not
+distributed here** — nobody in this project holds the rights to redistribute it.
+
+So the driver loads it at runtime from a file you supply. It looks, in order,
+at:
+
+1. `$GOODIX550C_FIRMWARE` (an explicit path), then
+2. `/etc/goodix550c-app.bin`, then
+3. `/usr/lib/firmware/goodix/550c-app.bin`, then
+4. `/usr/local/lib/firmware/goodix/550c-app.bin`.
+
+The image is checked against a known length (23436 bytes) and SHA-256
+(`7a230f03…49da6e8c`) before the driver will touch the device, and the
+existing PSK-derived HMAC self-check runs on top of that. A missing, truncated
+or mismatched file disables self-heal and is reported in the journal; it never
+results in a half-erased sensor, because the load happens before the erase.
+
+To install an image you have obtained:
+
+```
+sudo tools/install-firmware.sh /path/to/550c-app.bin
+```
+
+**Obtaining the image.** It is the application image the Windows Goodix stack
+writes to the sensor during provisioning, and it is recoverable from a USB
+capture of that provisioning sequence on your own machine — that is how this
+project got it. It is *not* stored verbatim in Lenovo's redistributable driver
+package (`GoodixEngineAdapter.dll` and friends), so it cannot simply be
+unpacked from the vendor download. See the RE repo for the capture procedure.
+
+If your sensor is already on the all-zero PSK, you do not need this file at
+all: self-heal is only for units still holding a Windows-provisioned PSK.
+
 ### Automatic self-heal
 
 You normally don't reprovision by hand. When the all-zero TLS-PSK handshake
-fails on open **and no PSK override is set**, the driver assumes the unit is
-still on a Windows-provisioned PSK and self-heals: it reprovisions the sensor to
-the all-zero PSK, then the sensor is usable on every subsequent open. A unit
-pinned to a recovered PSK (via the env var or config file) is left untouched —
-self-heal only runs on the default path.
+fails on open, **no PSK override is set**, and the vendor application image is
+installed, the driver assumes the unit is still on a Windows-provisioned PSK and
+self-heals: it reprovisions the sensor to the all-zero PSK, then the sensor is
+usable on every subsequent open. A unit pinned to a recovered PSK (via the env
+var or config file) is left untouched — self-heal only runs on the default path.
+
+The application image is loaded and verified **first**, before any device state
+changes. If it is missing or fails verification, self-heal declines to run and
+logs why; the sensor is never left erased without a way back.
 
 Before reflashing, the driver reads the sensor's PSK hash slot to decide what is
 actually wrong:

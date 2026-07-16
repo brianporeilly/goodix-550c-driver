@@ -7,3 +7,9 @@ sysext/goodix550c-fp/
 sysext/.stage/
 sysext-stage/
 opencv-bundle/
+
+# Goodix's proprietary application firmware is never redistributed from this
+# repo — the driver loads it at runtime from a file the machine's owner
+# supplies. See README.md, "Supplying the 550c application firmware".
+*.bin
+550c-app*

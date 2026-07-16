@@ -811,9 +811,9 @@ static void goodix_launch_open_ssm (FpDevice *dev);
  */
 static const guint8 goodix_550c_psk_filler[GOODIX_550C_PSK_FILLER_LEN] = { 0 };
 
-/* The all-zero-PSK check_firmware HMAC over goodix_550c_app_firmware. Derived
- * at runtime from the target PSK (goodix_550c_fw_hmac); this constant is only a
- * self-check that the derivation and the embedded firmware are intact before we
+/* The all-zero-PSK check_firmware HMAC over the vendor app image. Derived at
+ * runtime from the target PSK (goodix_550c_fw_hmac); this constant is only a
+ * self-check that the derivation and the supplied firmware are intact before we
  * touch the device. Verified against the genesis captures. */
 static const guint8 goodix_550c_allzero_fw_hmac[32] = {
   0x02, 0x5b, 0x4d, 0x2d, 0x83, 0xa8, 0x98, 0xab,
@@ -1122,8 +1122,8 @@ goodix_heal_ssm_handler (FpiSsm   *ssm,
             return;
           }
 
-        fp_warn ("Self-heal: reflashing app firmware (%d bytes)",
-                 GOODIX_550C_APP_FIRMWARE_LEN);
+        fp_warn ("Self-heal: reflashing app firmware (%" G_GSIZE_FORMAT " bytes)",
+                 self->heal_fw_len);
         self->heal_fw_offset = 0;
         fpi_ssm_jump_to_state (ssm, GOODIX_HEAL_WRITE_FW_SEND);
       }
@@ -1134,15 +1134,15 @@ goodix_heal_ssm_handler (FpiSsm   *ssm,
         guint32 off = self->heal_fw_offset;
         gsize remaining;
 
-        if (off >= GOODIX_550C_APP_FIRMWARE_LEN)
+        if (off >= self->heal_fw_len)
           {
             fpi_ssm_jump_to_state (ssm, GOODIX_HEAL_CHECK_FW);
             return;
           }
 
-        remaining = GOODIX_550C_APP_FIRMWARE_LEN - off;
+        remaining = self->heal_fw_len - off;
         goodix_cmd_write_firmware (
-            ssm, dev, off, goodix_550c_app_firmware + off,
+            ssm, dev, off, self->heal_fw + off,
             MIN (GOODIX_550C_FW_CHUNK, remaining), GOODIX_550C_FW_NUMBER);
       }
       break;
@@ -1267,6 +1267,9 @@ static gboolean
 goodix_maybe_start_selfheal (FpDevice *dev)
 {
   FpiDeviceGoodix53x5 *self = FPI_DEVICE_GOODIX53X5 (dev);
+  g_autoptr(GError) fw_error = NULL;
+  const guint8 *fw;
+  gsize fw_len = 0;
   guint8 expected[32];
   FpiSsm *ssm;
 
@@ -1284,16 +1287,24 @@ goodix_maybe_start_selfheal (FpDevice *dev)
       return FALSE;
     }
 
+  /* Load the vendor app image up front: the heal erases the app to reach IAP,
+   * so without an image to write back the sensor would be left bricked. Failing
+   * here (before the erase) is what keeps that from happening. */
+  fw = goodix_550c_app_firmware_load (&fw_len, &fw_error);
+  if (fw == NULL)
+    {
+      fp_warn ("Self-heal unavailable: %s", fw_error->message);
+      return FALSE;
+    }
+
   /* Derive the target (all-zero) check_firmware HMAC and self-check it against
    * the verified constant before we touch the device — a mismatch means the
-   * embedded firmware or the derivation is wrong, so refuse to reflash. */
-  goodix_550c_fw_hmac (goodix_psk, GOODIX_PSK_LEN,
-                       goodix_550c_app_firmware, GOODIX_550C_APP_FIRMWARE_LEN,
-                       expected);
+   * supplied firmware or the derivation is wrong, so refuse to reflash. */
+  goodix_550c_fw_hmac (goodix_psk, GOODIX_PSK_LEN, fw, fw_len, expected);
   if (memcmp (expected, goodix_550c_allzero_fw_hmac, 32) != 0)
     {
       fp_warn ("Self-heal aborted: firmware HMAC self-check failed "
-               "(embedded firmware or key derivation is corrupt)");
+               "(supplied firmware or key derivation is corrupt)");
       return FALSE;
     }
 
@@ -1305,6 +1316,8 @@ goodix_maybe_start_selfheal (FpDevice *dev)
   self->heal_erased = FALSE;
   self->heal_already_provisioned = FALSE;
   self->heal_fw_offset = 0;
+  self->heal_fw = fw;
+  self->heal_fw_len = fw_len;
   memcpy (self->heal_fw_hmac, expected, 32);
   g_clear_pointer (&self->heal_container, g_free);
   self->heal_container = goodix_550c_build_container ();

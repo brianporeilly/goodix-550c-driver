@@ -164,6 +164,8 @@ struct _FpiDeviceGoodix53x5
   gboolean heal_already_provisioned; /* hash slot already == all-zero: skip reflash */
   guint32  heal_fw_offset;      /* running offset of the firmware reflash loop */
   guint8   heal_fw_hmac[32];    /* PSK-derived check_firmware HMAC (target PSK) */
+  const guint8 *heal_fw;        /* app image to reflash; owned by the loader */
+  gsize    heal_fw_len;
   guint8  *heal_container;      /* assembled 446-byte PSK container */
   gsize    heal_container_len;
 
