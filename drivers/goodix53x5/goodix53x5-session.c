@@ -80,8 +80,8 @@ typedef enum {
 static const guint8 goodix_psk[GOODIX_PSK_LEN] = { 0 };
 
 /*
- * A unit still on its factory (Windows-provisioned, DPAPI-wrapped) per-machine
- * PSK can override the all-zero default with its recovered value via the
+ * A unit still holding a Windows-provisioned (DPAPI-wrapped, per-provision
+ * random) PSK can override the all-zero default with its recovered value via the
  * GOODIX550C_PSK environment variable (64 hex chars) or the file
  * /etc/goodix550c.psk. See the driver README for how to recover and, preferably,
  * how to reprovision the sensor to the all-zero PSK instead.

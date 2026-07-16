@@ -32,16 +32,18 @@ all-zero PSK, driving libfprint's own `enroll` / `verify` example tools.
 
 ## The PSK — reprovisioned to all-zero
 
-Out of the factory the 550c stores a **per-machine** PSK DPAPI-wrapped in the
-sensor, which Windows decrypts at runtime. The reverse-engineering repo
-established that the sensor can be **reprovisioned from Linux to the same
-all-zero PSK the rest of the Goodix 51x0/52xd/55x4 family uses** (write the
-family white-box to the PSK slot inside a container write, then reflash — see
-`provision_container_allzero.py` in the RE repo). Once reprovisioned, the sensor
-is fully plug-and-play: this driver **defaults to the all-zero PSK** and needs no
+The 550c protects its image channel with a TLS-PSK, and that PSK is **not a
+fixed factory key**: the Windows Goodix stack generates a fresh random PSK each
+time it provisions the sensor and stores it DPAPI-wrapped, which Windows
+decrypts at runtime. So whatever PSK a unit currently holds is just the one its
+last Windows provisioning wrote. The reverse-engineering work established that
+the sensor can be **reprovisioned from Linux to the same all-zero PSK the rest
+of the Goodix 51x0/52xd/55x4 family uses** (write the family white-box to the PSK
+slot inside a container write, then reflash). Once reprovisioned, the sensor is
+fully plug-and-play: this driver **defaults to the all-zero PSK** and needs no
 configuration.
 
-A unit still on its factory per-machine PSK can override the default with its
+A unit still holding a Windows-provisioned PSK can override the default with its
 recovered value (until it is reprovisioned) via either:
 
 - the `GOODIX550C_PSK` environment variable (64 hex chars), or
