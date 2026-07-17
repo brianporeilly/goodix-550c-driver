@@ -93,18 +93,35 @@ existing PSK-derived HMAC self-check runs on top of that. A missing, truncated
 or mismatched file disables self-heal and is reported in the journal; it never
 results in a half-erased sensor, because the load happens before the erase.
 
-To install an image you have obtained:
+**Obtaining the image.** You do not need Windows, and you do not need to
+capture anything. The image is stored **verbatim inside `Wbdi.dll`** in
+Lenovo's publicly downloadable fingerprint driver package, and the 12-byte
+header the Windows stack prepends before writing it is fully derived from the
+payload — so the exact image can be rebuilt from the vendor download:
 
 ```
-sudo tools/install-firmware.sh /path/to/550c-app.bin
+tools/extract-firmware.py /path/to/lenovo-fingerprint-driver.zip
+sudo tools/install-firmware.sh 550c-app.bin
 ```
 
-**Obtaining the image.** It is the application image the Windows Goodix stack
-writes to the sensor during provisioning, and it is recoverable from a USB
-capture of that provisioning sequence on your own machine — that is how this
-project got it. It is *not* stored verbatim in Lenovo's redistributable driver
-package (`GoodixEngineAdapter.dll` and friends), so it cannot simply be
-unpacked from the vendor download. See the RE repo for the capture procedure.
+The extractor accepts the `.zip`, an unpacked directory, or `Wbdi.dll` itself.
+It locates the payload by its version tag, rebuilds the header, and verifies the
+result against the known digest before writing anything.
+
+The layout, for the record — `<version string><payload>` sits in `Wbdi.dll`'s
+`.rdata`, and:
+
+| Bytes | Meaning |
+|---|---|
+| `[0:4]` | `crc32-mpeg2` of the next 8 bytes (header checksum) |
+| `[4:8]` | payload length, uint32 LE (23424) |
+| `[8:12]` | `crc32-mpeg2` of the payload |
+| `[12:]` | the application image, verbatim from `Wbdi.dll` |
+
+This driver still ships no firmware: the image is Goodix's, and extracting it
+from your own copy of the vendor package keeps it that way. Note the sensor
+cannot supply it either — the 550c does not answer `read_firmware` (`0xf2`),
+unlike its 53x5 siblings, so it cannot be dumped off the device.
 
 If your sensor is already on the all-zero PSK, you do not need this file at
 all: self-heal is only for units still holding a Windows-provisioned PSK.
