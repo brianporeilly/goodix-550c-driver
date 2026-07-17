@@ -97,16 +97,42 @@ results in a half-erased sensor, because the load happens before the erase.
 capture anything. The image is stored **verbatim inside `Wbdi.dll`** in
 Lenovo's publicly downloadable fingerprint driver package, and the 12-byte
 header the Windows stack prepends before writing it is fully derived from the
-payload — so the exact image can be rebuilt from the vendor download:
+payload — so the exact image can be rebuilt from the vendor download.
+
+Download Lenovo's *FingerPrinter Driver (Goodix, FPC)* package for the Yoga 9
+14IRP8 — support page [DS560180][ds560180] — and run:
 
 ```
-tools/extract-firmware.py /path/to/lenovo-fingerprint-driver.zip
+tools/extract-firmware.py mfyo027fx76fy1f0.exe
 sudo tools/install-firmware.sh 550c-app.bin
 ```
 
-The extractor accepts the `.zip`, an unpacked directory, or `Wbdi.dll` itself.
-It locates the payload by its version tag, rebuilds the header, and verifies the
+or let the tool fetch it for you:
+
+```
+tools/extract-firmware.py --download
+```
+
+`--download` retrieves the package **from Lenovo to your machine, at your
+explicit request**, and checks it against the SHA-256 Lenovo publishes on that
+page. This driver mirrors nothing and ships no firmware. The download is a
+plain static file: no account, no click-through agreement.
+
+The extractor also accepts `Wbdi.dll`, an unpacked directory, or a `.zip`. It
+locates the payload by its version tag, rebuilds the header, and verifies the
 result against the known digest before writing anything.
+
+Lenovo ships the driver as a Lenovo-modified **Inno Setup** installer, whose
+payload is LZMA-compressed — so the firmware is not visible in the `.exe`
+itself. Unpacking needs [`innoextract`][innoextract] (`dnf install innoextract`
+/ `apt install innoextract`), which the tool invokes for you. If you would
+rather unpack it yourself, point the tool at the resulting directory.
+
+Other laptops carrying a 550c ship their own driver package; find yours on your
+vendor's support site and pass the installer as an argument.
+
+[ds560180]: https://pcsupport.lenovo.com/us/en/products/laptops-and-netbooks/yoga-series/yoga-9-14irp8/downloads/ds560180-fingerprinter-driver-goodix-fpc-for-windows-11-64-bit-yoga-9-14irp8
+[innoextract]: https://constexpr.org/innoextract/
 
 The layout, for the record — `<version string><payload>` sits in `Wbdi.dll`'s
 `.rdata`, and:
